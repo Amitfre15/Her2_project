@@ -1,0 +1,47 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+
+        {
+            "name": "Python Debugger: Current File",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${file}",
+            "console": "integratedTerminal",
+            "python": "/home/sgils/miniconda3/envs/conda_master_updated/bin/python3",
+            "args": [
+                "--task_cfg_path", "/home/amitf/workspace/Gigapath_GIP/finetune/task_configs/Her2.yaml",
+                "--dataset_csv", "/home/amitf/workspace/WSI/metadata_csvs/Her2_slides_matched_HE_folds.csv",
+                "--root_path", "/SSDStorage/Breast/gigapath_CAT_features/gigapath_features_mpp1",
+                "--model_arch", "gigapath_slide_enc12l768d",
+                "--blr", "0.002",
+                "--layer_decay", "0.95",
+                "--optim_wd", "0.05",
+                "--dropout", "0.1",
+                "--drop_path_rate", "0.0",
+                "--val_r", "0.1",
+                "--epochs", "5",
+                "--input_dim", "1536",
+                "--latent_dim", "768",
+                "--feat_layer", "11",
+                "--warmup_epochs", "1",
+                "--gc", "32",
+                "--model_select", "last_epoch",
+                "--lr_scheduler", "cosine",
+                "--folds", "1",
+                "--save_dir", "outputs/SW_IHC_to_Her2_score/",
+                "--pretrained", "hf_hub:prov-gigapath/prov-gigapath",
+                "--report_to", "tensorboard",
+                "--exp_name", "SW_stride1_sigma1_0.3win_IHC_to_Her2_score_infer1",
+                "--max_wsi_size", "250000",
+                "--train_dataset", "['Carmel_IHC']",
+                "--train_fold", "[2,3,4,5]",
+                "--test_dataset", "['Carmel_IHC']",
+                "--test_fold", "[1]",
+                "--label", "label",
+                "--sliding_window_inference",
+                "--model_ckpt", "/home/amitf/outputs/IHC_to_Her2_score/her2/IHC_to_Her2_score_val1/eval_pretrained_her2/fold_0/checkpoint.pt"
+            ]
+        }
+    ]
+}

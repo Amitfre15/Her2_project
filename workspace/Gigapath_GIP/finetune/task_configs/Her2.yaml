@@ -1,0 +1,4 @@
+name: her2
+setting: continuous
+max_tiles: 1000000
+shuffle_tiles: true
