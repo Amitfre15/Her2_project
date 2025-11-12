@@ -3,19 +3,17 @@ import torch
 import pandas as pd
 import numpy as np
 
-from training import train, test, generate_heatmap, run_window_inference
+from training import train, test, generate_heatmap, run_window_inference, train_cycleGAN
 from params import get_finetune_params
 from task_configs.utils import load_task_config
 from utils import seed_torch, get_exp_code, get_loader, save_obj, get_test_loader
 from datasets.slide_datatset import SlideDataset, SlidingWindowDataset
-from dotenv import load_dotenv
-load_dotenv()
-HF_TOKEN = os.getenv("HF_TOKEN")
-
 
 if __name__ == '__main__':
     # Set the hf token
-    os.environ["HF_TOKEN"] = os.getenv("HF_TOKEN")
+    with open("/home/amitf/workspace/Gigapath_GIP/finetune/hf_token.txt", "r") as file:
+        os.environ["HF_TOKEN"] = file.read()
+    # os.environ["HF_TOKEN"] = ""
 
     args = get_finetune_params()
     print(args)
@@ -88,6 +86,11 @@ if __name__ == '__main__':
     if args.window_training:
         args.dataset = dataset
 
+    if args.cat_y and 'hf' not in args.pretrained:  # Delete
+        args.input_dim += 1  # Add one more dimension for the IHC score
+
+    args.mpp = args.root_path[args.root_path.find('mpp'):]
+
     # set up the results dictionary
     results = {}
 
@@ -101,15 +104,18 @@ if __name__ == '__main__':
             train_data, val_data, test_data = DatasetClass(dataset, args.root_path, args.task_config, slide_key=args.slide_key, label = args.label, \
                                                            dataset_name = args.train_dataset, folds = args.train_fold, use_clinical_features = args.clinical_features, censoreship = args.censoreship, survival = args.survival,
                                                            batches = args.batches, slide_path_key = args.slide_path_key, window_training = args.window_training,
-                                                           teacher_label=args.teacher_label) \
+                                                           teacher_label=args.teacher_label, oversample=args.oversample, use_tile_classification=args.use_tile_classification, comp_power=args.comp_power, 
+                                                           cycle_gan_train=args.cycle_gan_train, synth_ihc_train=args.synth_ihc_train, val_fold=args.val_fold[-1]) \
                                             , DatasetClass(dataset, args.root_path, args.task_config, slide_key=args.slide_key, label = args.label, \
                                                            dataset_name = args.val_dataset, folds = args.val_fold, use_clinical_features = args.clinical_features, test_on_all = args.test_on_all, censoreship = args.censoreship, survival = args.survival,
                                                            batches = args.batches, slide_path_key = args.slide_path_key, window_training = args.window_training,
-                                                           teacher_label=args.teacher_label) if len(args.val_dataset) > 0 else None \
+                                                           teacher_label=args.teacher_label, comp_power=args.comp_power, cycle_gan_train=args.cycle_gan_train,
+                                                           synth_ihc_train=args.synth_ihc_train, val_fold=args.val_fold[-1]) if len(args.val_dataset) > 0 else None \
                                             , DatasetClass(dataset, args.root_path, args.task_config, slide_key=args.slide_key, label = args.label, \
                                                            dataset_name = args.test_dataset, folds = args.test_fold, use_clinical_features = args.clinical_features, test_on_all = args.test_on_all, censoreship = args.censoreship, survival = args.survival, 
                                                            batches = args.batches, slide_path_key = args.slide_path_key, window_training = args.window_training,
-                                                           teacher_label=args.teacher_label) if len(args.test_dataset) > 0 else None
+                                                           teacher_label=args.teacher_label, comp_power=args.comp_power, cycle_gan_train=args.cycle_gan_train,
+                                                           synth_ihc_train=args.synth_ihc_train, val_fold=args.val_fold[-1]) if len(args.test_dataset) > 0 else None
             #scale the lr in case of regression
             if args.task_config.get('setting', 'multi_class') == 'continuous' and not args.loss_fn == 'cox':
                 args.mean = train_data.labels.mean()
@@ -137,23 +143,27 @@ if __name__ == '__main__':
             args.n_classes = train_data.n_classes # get the number of classes
             # get the dataloader
             train_loader, val_loader, test_loader = get_loader(train_data, val_data, test_data, **vars(args))
-            # start training
-            val_records, test_records = train((train_loader, val_loader, test_loader), fold, args)
+            if not args.cycle_gan_train:
+                # start training
+                val_records, test_records = train((train_loader, val_loader, test_loader), fold, args)
 
-            # update the results
-            records = {}
-            if val_records is not None:
-                records['val'] = val_records
-            if test_records is not None:
-                records['test'] = test_records
-            for record_ in records:
-                for key in records[record_]:
-                    if 'prob' in key or 'label' in key or 'censoreship' in key:
-                        continue
-                    key_ = record_ + '_' + key
-                    if key_ not in results:
-                        results[key_] = []
-                    results[key_].append(records[record_][key])
+                # update the results
+                records = {}
+                if val_records is not None:
+                    records['val'] = val_records
+                if test_records is not None:
+                    records['test'] = test_records
+                for record_ in records:
+                    for key in records[record_]:
+                        if 'prob' in key or 'label' in key or 'censoreship' in key:
+                            continue
+                        key_ = record_ + '_' + key
+                        if key_ not in results:
+                            results[key_] = []
+                        results[key_].append(records[record_][key])
+            else:
+                # start training
+                val_records, test_records = train_cycleGAN((train_loader, val_loader, test_loader), fold, args)
     elif args.run_inference or args.generate_heatmap:
         save_dir = os.path.join(args.save_dir, f'inference_results')
         os.makedirs(save_dir, exist_ok=True)
@@ -161,7 +171,8 @@ if __name__ == '__main__':
         test_data = DatasetClass(dataset, args.root_path, args.task_config, slide_key=args.slide_key, label = args.label, \
                                  dataset_name = args.test_dataset, folds = args.test_fold, use_clinical_features = args.clinical_features, \
                                  test_on_all = args.test_on_all, get_single_slide = args.get_single_slide, censoreship = args.censoreship, survival = args.survival,
-                                 batches = args.batches, slide_path_key = args.slide_path_key, window_training = args.window_training, teacher_label=args.teacher_label)
+                                 batches = args.batches, slide_path_key = args.slide_path_key, window_training = args.window_training, teacher_label=args.teacher_label, 
+                                 comp_power=args.comp_power, synth_ihc_train=args.synth_ihc_train, val_fold=args.val_fold[-1])
         if args.clinical_features:
             num_clinical_features = len(test_data.columns)
             args.input_dim = args.input_dim + num_clinical_features

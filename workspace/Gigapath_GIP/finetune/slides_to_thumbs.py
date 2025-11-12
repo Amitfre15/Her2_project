@@ -16,7 +16,8 @@ from utils import get_test_loader
 
 OPENSLIDE_PATH = r"C:\Program Files\openslide-bin-4.0.0.3-windows-x64\openslide-bin-4.0.0.3-windows-x64\bin"
 # DESIRED_MPP = 0.5
-DESIRED_MPP = 1
+# DESIRED_MPP = 1
+DESIRED_MPP = 2
 SLIDE_PATCH_SIZE = 256
 SLIDE_MPP = 0.242797397769517
 SLIDE_HEIGHT = 204614
@@ -25,7 +26,10 @@ HE_THUMB_HEIGHT = 10230
 HE_THUMB_WIDTH = 4473
 IHC_THUMB_HEIGHT = 5115
 IHC_THUMB_WIDTH = 2237
+SEG_THUMB_HEIGHT = 97
+SEG_THUMB_WIDTH = 42
 IHC_SCALE_PATCH_SIZE = round(SLIDE_PATCH_SIZE * (IHC_THUMB_WIDTH / SLIDE_WIDTH) / 0.25)
+SEG_SCALE_PATCH_SIZE = math.ceil(SLIDE_PATCH_SIZE * (SEG_THUMB_WIDTH / SLIDE_WIDTH) / 0.25)
 
 if hasattr(os, 'add_dll_directory'):
     # Windows
@@ -346,11 +350,19 @@ def parse_tile_name(tile_name):
     else:
         raise ValueError(f"Invalid tile_name format: {tile_name}")
 
-
-def find_matching_score(score_mat: np.array, map_mat: np.array, tile_name: str = None, window_name: str = None, find_tile: bool = False, 
-                        tiles: list = None, tile_df_row: dict = None):
+def correct_coords(window_center: list, inverse: bool = False):
     rounded_mpp = round_mpp(SLIDE_MPP)
     mpp_correction_factor = SLIDE_MPP / rounded_mpp
+    if not inverse:
+        window_center = tuple(map(lambda x: x * (mpp_correction_factor * DESIRED_MPP) / SLIDE_MPP, window_center))
+    else:  # inverse correction
+        window_center = tuple(map(lambda x: int(x * SLIDE_MPP / (mpp_correction_factor * DESIRED_MPP)), window_center))
+    return window_center
+
+def find_matching_score(score_mat: np.array, map_mat: np.array, tile_name: str = None, window_name: str = None, find_tile: bool = False, 
+                        tiles: list = None, tile_df_row: dict = None, ihc_tile: bool = None):
+    # rounded_mpp = round_mpp(SLIDE_MPP)
+    # mpp_correction_factor = SLIDE_MPP / rounded_mpp
 
     if tile_name is not None:
         x_start, x_end, y_start, y_end = parse_tile_name(tile_name=tile_name)
@@ -360,11 +372,18 @@ def find_matching_score(score_mat: np.array, map_mat: np.array, tile_name: str =
         print("No tile/window name was given, can not find matching score")
         return
 
-    x_start, x_end, y_start, y_end = tuple(map(lambda x: x * mpp_correction_factor / SLIDE_MPP, (x_start, x_end, y_start, y_end)))
     he_window_center = ((x_end + x_start) // 2, (y_end + y_start) // 2)
-    he_thumb_window_center = slide_to_thumb_coord(slide_coord=he_window_center,
-                                                  slide_dimensions=(SLIDE_WIDTH, SLIDE_HEIGHT),
-                                                  thumb_size=(HE_THUMB_WIDTH, HE_THUMB_HEIGHT))
+    # he_window_center = tuple(map(lambda x: x * (mpp_correction_factor * DESIRED_MPP) / SLIDE_MPP, he_window_center))
+    he_window_center = correct_coords(he_window_center)
+    
+    if not ihc_tile:
+        he_thumb_window_center = slide_to_thumb_coord(slide_coord=he_window_center,
+                                                    slide_dimensions=(SLIDE_WIDTH, SLIDE_HEIGHT),
+                                                    thumb_size=(HE_THUMB_WIDTH, HE_THUMB_HEIGHT))
+    else: # IHC tile
+        he_thumb_window_center = slide_to_thumb_coord(slide_coord=he_window_center,
+                                                    slide_dimensions=(SLIDE_WIDTH, SLIDE_HEIGHT),
+                                                    thumb_size=(IHC_THUMB_WIDTH, IHC_THUMB_HEIGHT))
     
     he_thumb_window_center = min(he_thumb_window_center[0], map_mat.shape[0] - 1), min(he_thumb_window_center[1], map_mat.shape[1] - 1)
     if window_name is not None:
@@ -380,24 +399,32 @@ def find_matching_score(score_mat: np.array, map_mat: np.array, tile_name: str =
         score = matching_scores[matching_scores != 0]
         score = np.mean(score)
     else:
-        ihc_thumb_window_center = map_mat[he_thumb_window_center[0], he_thumb_window_center[1]][:2]
-        if np.all(ihc_thumb_window_center == [0, 0]):
-            return None
-        score = score_mat[ihc_thumb_window_center[1], ihc_thumb_window_center[0]]
-        if score == 0:
+        if not ihc_tile:
+            ihc_thumb_window_center = map_mat[he_thumb_window_center[0], he_thumb_window_center[1]][:2]
+            if np.all(ihc_thumb_window_center == [0, 0]):
+                return None
+            if not find_tile:    
+                score = score_mat[ihc_thumb_window_center[1], ihc_thumb_window_center[0]]
+        else: # IHC tile
+            ihc_thumb_window_center = min(he_thumb_window_center[0], score_mat.shape[0] - 1), min(he_thumb_window_center[1], score_mat.shape[1] - 1)
+            if not find_tile:
+                score = score_mat[ihc_thumb_window_center[0], ihc_thumb_window_center[1]]
+        if not find_tile and score == 0:
             return None
         if find_tile:
             ihc_window_center = thumb_to_slide_coord(thumb_coord=ihc_thumb_window_center,
                                                   slide_dimensions=(SLIDE_WIDTH, SLIDE_HEIGHT),
                                                   thumb_size=(IHC_THUMB_WIDTH, IHC_THUMB_HEIGHT))
-            ihc_window_center = tuple(map(lambda x: int(x * SLIDE_MPP / mpp_correction_factor), ihc_window_center))
+            # ihc_window_center = tuple(map(lambda x: int(x * SLIDE_MPP / (mpp_correction_factor * DESIRED_MPP)), ihc_window_center))
+            ihc_window_center = correct_coords(ihc_window_center, inverse=True)
             ret_val = find_tile_index(ref_x=ihc_window_center[1], ref_y=ihc_window_center[0], tiles=tiles) # check
             if ret_val is None:
                 return None
             else:
                 tile_index, ihc_tile = ret_val
-            tile_df_row['IHC_tile'], tile_df_row['HE_tile_thumb_coords'], tile_df_row['IHC_tile_thumb_coords'] = ihc_tile, he_thumb_window_center, np.flip(ihc_thumb_window_center)
-            tile_df_row['tile_label'] = score
+            if tile_df_row:
+                tile_df_row['IHC_tile'], tile_df_row['HE_tile_thumb_coords'], tile_df_row['IHC_tile_thumb_coords'] = ihc_tile, he_thumb_window_center, np.flip(ihc_thumb_window_center)
+                tile_df_row['tile_label'] = score
             return tile_index        
 
     return score
@@ -416,14 +443,17 @@ def find_tile_index(ref_x, ref_y, tiles):
     return None  # No matching tile found
 
 
-def show_score_matrix(score_matrix, slide_name):
+def show_score_matrix(score_matrix, slide_name, save_dir=None, vmin=-1, vmax=4):
     plt.figure(figsize=(10, 8))
     plt.title(f"Score Matrix for Slide: {slide_name}")
-    plt.imshow(score_matrix, cmap='gray', interpolation='none', vmin=-1, vmax=4)
+    plt.imshow(score_matrix, cmap='jet', interpolation='none', vmin=vmin, vmax=vmax)
     plt.colorbar(label='Score')
     plt.xlabel('X Coordinate')
     plt.ylabel('Y Coordinate')
     plt.tight_layout()
+    if save_dir:
+        full_save_dir = os.path.join(save_dir, f"{slide_name}_score_matrix.png")
+        plt.savefig(full_save_dir, dpi=300)
     plt.show()
 
 
@@ -524,10 +554,11 @@ def gaussian_patches_matrix(weight_matrix: torch.tensor, gaus_window: torch.tens
     k_height, k_width = gaus_window.size()
 
     # Flatten img_coords for easier handling
-    start_x = img_coords[:, :, 0].long().flatten()  # x_start
-    start_y = img_coords[:, :, 1].long().flatten()  # y_start
+    start_x = img_coords[:, 0].long().flatten()  # x_start
+    start_y = img_coords[:, 1].long().flatten()  # y_start
 
-    pad_pixels = int(IHC_SCALE_PATCH_SIZE * 0.25)
+    # pad_pixels = int(IHC_SCALE_PATCH_SIZE * 0.25)
+    pad_pixels = int(SEG_SCALE_PATCH_SIZE * 0.25)
     # Create a grid for the small_matrix offsets
     x_range = torch.arange(-pad_pixels, k_height - pad_pixels).repeat(k_height).view(k_height,
                                                            k_height).t().flatten().to(device=start_x.device)  # Row indices for the small matrix
@@ -560,19 +591,23 @@ def gaussian_patches_matrix(weight_matrix: torch.tensor, gaus_window: torch.tens
 
 def patch_weighted_score_matrices(weighted_score_matrix: torch.tensor, weight_matrix: torch.tensor,
                                   img_coords: torch.tensor, window_score: float):
-    rounded_mpp = round_mpp(SLIDE_MPP)
-    mpp_correction_factor = SLIDE_MPP / rounded_mpp
+    # rounded_mpp = round_mpp(SLIDE_MPP)
+    # mpp_correction_factor = SLIDE_MPP / rounded_mpp
 
-    img_coords = img_coords * mpp_correction_factor / SLIDE_MPP
+    # img_coords = img_coords * mpp_correction_factor / SLIDE_MPP
+    img_coords = correct_coords(img_coords)[0]
 
     # Calculate scale factors
-    scale = IHC_THUMB_WIDTH / SLIDE_WIDTH
+    # scale = IHC_THUMB_WIDTH / SLIDE_WIDTH
+    scale = SEG_THUMB_WIDTH / SLIDE_WIDTH
 
     # Convert slide coordinates to thumbnail coordinates
     img_thumb_coords = (img_coords * scale).to(torch.int32)
 
-    pad_pixels = int(IHC_SCALE_PATCH_SIZE * 0.25)
-    gaus_win_side = IHC_SCALE_PATCH_SIZE + 2 * pad_pixels
+    # pad_pixels = int(IHC_SCALE_PATCH_SIZE * 0.25)
+    # gaus_win_side = IHC_SCALE_PATCH_SIZE + 2 * pad_pixels
+    pad_pixels = int(SEG_SCALE_PATCH_SIZE * 0.25)
+    gaus_win_side = SEG_SCALE_PATCH_SIZE + 2 * pad_pixels
     sq_gaus_window_size = (gaus_win_side, gaus_win_side)
     gaussian_window = gaussian_2d_kernel(shape=sq_gaus_window_size, window_amp=True, patch_num=img_coords.size(1))
 
@@ -582,13 +617,14 @@ def patch_weighted_score_matrices(weighted_score_matrix: torch.tensor, weight_ma
     weight_matrix += curr_weight_matrix
 
 
-def create_tile_scores_matching_tiles(window: bool = False, matching_tile: bool = False, create_samples_csv: bool = False):
-    args = get_finetune_params()
-    print(args)
-    args.task_config = load_task_config(args.task_cfg_path)
+def create_tile_scores_matching_tiles(window: bool = False, matching_tile: bool = False, create_samples_csv: bool = False, ihc_tile: bool = False):
+    if window:
+        args = get_finetune_params()
+        print(args)
+        args.task_config = load_task_config(args.task_cfg_path)
     
-    slides_excel_path = os.path.join("WSI", "metadata_csvs", "Her2_slides_matched_HE_folds.csv")
-    tile_df_save_path = os.path.join("WSI", "metadata_csvs", "Tile_samples.csv")
+    slides_excel_path = os.path.join("workspace", "WSI", "metadata_csvs", "Her2_slides_matched_HE_folds.csv")
+    tile_df_save_path = os.path.join("workspace", "WSI", "metadata_csvs", "Tile_samples.csv")
     df = pd.read_csv(slides_excel_path)
     he_slides_w_map = df[(df["Path"].str.contains("Batch_1", case=False, na=False)) | (df["Path"].str.contains("Batch_2", case=False, na=False))][["SlideName", "Matched_HE_SlideName", "fold", "label", "patient barcode", "label"]]
     he_slides_w_map["SlideName"] = he_slides_w_map["SlideName"].apply(lambda x: x.split('.')[0])
@@ -598,15 +634,19 @@ def create_tile_scores_matching_tiles(window: bool = False, matching_tile: bool 
 
     map_matrix_dir = os.path.join(os.sep, "SSDStorage", "Breast", "Carmel", "png_thumb_pairs_karin")
     score_matrix_dir = os.path.join(os.sep, "home", "amitf", "outputs", "SW_IHC_to_Her2_score", "her2")
-    tiles_path = os.path.join(os.sep, "SSDStorage", "Breast", "gigapath_CAT_features", "png_tiles_mpp1")
-    labels_path = os.path.join(os.sep, "SSDStorage", "Breast", "Carmel", "Her2", "gigapath_IHC", "tile_labels_mpp1")
+    # tiles_path = os.path.join(os.sep, "SSDStorage", "Breast", "gigapath_CAT_features", "png_tiles_mpp1")
+    tiles_path = os.path.join(os.sep, "SSDStorage", "Breast", "Carmel", "Her2", "gigapath_HE", "png_tiles_mpp2")
+    # labels_path = os.path.join(os.sep, "SSDStorage", "Breast", "Carmel", "Her2", "gigapath_IHC", "tile_labels_mpp1")
+    labels_path = os.path.join(os.sep, "SSDStorage", "Breast", "Carmel", "Her2", "gigapath_IHC", "tile_labels_mpp2")
+    # ihc_tiles_path = labels_path.replace("tile_labels", "png_tiles")
+    ihc_tiles_path = tiles_path.replace("HE", "IHC")
+    if ihc_tile:
+        labels_path = labels_path.replace("tile", "ihc_tile")
     matching_tiles_path = labels_path.replace("tile_labels", "matching_tiles")
-    ihc_tiles_path = labels_path.replace("tile_labels", "png_tiles")
     if window:
         labels_path = labels_path.replace("tile", "window")
     labels_hist_path = os.path.join(labels_path, "local_labels_hist.npy")
     if create_samples_csv:
-        tile_samples_path = os.path.join(os.path.dirname(labels_path), "tile_samples.csv")
         df_columns = ['HE_slide', 'IHC_slide', 'HE_tile', 'IHC_tile', 'HE_tile_thumb_coords', 'IHC_tile_thumb_coords', 'Slide_label', 'tile_label',
                       'fold', 'patient_id', 'HE_features_path', 'HE_features_tile_index', 'HE_tile_path', 'IHC_features_path', 'IHC_features_tile_index', 'IHC_tile_path']
         tile_df = pd.DataFrame(columns=df_columns)
@@ -615,13 +655,15 @@ def create_tile_scores_matching_tiles(window: bool = False, matching_tile: bool 
     if not os.path.exists(labels_path):
         os.makedirs(labels_path, exist_ok=True)
     
-    if not os.path.exists(matching_tiles_path):
+    if matching_tile and not os.path.exists(matching_tiles_path):
         os.makedirs(matching_tiles_path, exist_ok=True)
 
     for row in he_slides_w_map.itertuples(index=True, name="Row"):
         ihc_slide, dir, fold, block, patient_id, slide_label = row.SlideName, row.Matched_HE_SlideName, row.fold, row.block, row.patient_id, row.label
-        # if not ihc_slide.startswith('21-5596_1_6'):
-        #     continue
+        if not dir.startswith('21-6922'): 
+            continue
+        if ihc_tile:
+            dir = ihc_slide
         dir_labels_path = os.path.join(labels_path, dir)
         dir_mt_path = os.path.join(matching_tiles_path, dir)
         save_path = os.path.join(dir_labels_path, "tile_scores.npy") if not matching_tile else os.path.join(dir_mt_path, "ihc_tiles.npy")
@@ -632,7 +674,7 @@ def create_tile_scores_matching_tiles(window: bool = False, matching_tile: bool 
             if not matching_tile:
                 local_labels = np.load(save_path).flatten()
                 valid_local_labels = local_labels[~np.isnan(local_labels.astype(float))]
-                if valid_local_labels.size < 100:
+                if valid_local_labels.size < 10000:
                     print(f"ihc_slide = {ihc_slide}, valid_local_labels.size = {valid_local_labels.size}") # Delete
                 if all_local_labels is None:
                     all_local_labels = valid_local_labels
@@ -648,20 +690,21 @@ def create_tile_scores_matching_tiles(window: bool = False, matching_tile: bool 
         if not os.path.exists(dir_labels_path):
             os.makedirs(dir_labels_path, exist_ok=True)
 
-        if not os.path.exists(dir_mt_path):
+        if matching_tile and not os.path.exists(dir_mt_path):
             os.makedirs(dir_mt_path, exist_ok=True)
         
         score_mat_fold_dir = os.path.join(score_matrix_dir, f"SW_stride1_sigma1_0.3win_IHC_to_Her2_score_infer{fold}", "eval_pretrained_her2", "inference_results")
         score_mat_full_path = os.path.join(score_mat_fold_dir, f"{ihc_slide}_score_matrix.npz")
         if os.path.exists(score_mat_full_path):
             score_mat = np.load(score_mat_full_path)['arr_0']  # saved as .npz file
-        elif not matching_tile:
+            show_score_matrix(score_matrix=score_mat, slide_name=ihc_slide, save_dir=dir_labels_path)
+        elif not matching_tile: # for matching tiles, we can skip if score matrix not found
             print(f"score matrix was not found at {score_mat_full_path}")
             continue
 
         block_map_matrix_dir = os.path.join(map_matrix_dir, block)
         try:
-            map_matrix_file = next(filter(lambda x: x.startswith('map'), os.listdir(block_map_matrix_dir)))
+            map_matrix_file = next(filter(lambda x: x.startswith('map') and ihc_slide in x, os.listdir(block_map_matrix_dir)))
         except BaseException as e:
             print(f"map matrix was not found at {block_map_matrix_dir}\n{e}")
             continue
@@ -671,13 +714,13 @@ def create_tile_scores_matching_tiles(window: bool = False, matching_tile: bool 
         map_img = cv2.cvtColor(map_img, cv2.COLOR_BGR2RGB)
         map_mat = np.array(map_img)  # .transpose(1, 0, 2)
 
-        full_tiles_dir = os.path.join(tiles_path, dir)
+        full_tiles_dir = os.path.join(tiles_path, dir) if not ihc_tile else os.path.join(ihc_tiles_path, dir)
 
         if not matching_tile:
             scores = []
             if not window:
                 for tile in os.listdir(full_tiles_dir):
-                    scores.append(find_matching_score(tile_name=tile, score_mat=score_mat, map_mat=map_mat))
+                    scores.append(find_matching_score(tile_name=tile, score_mat=score_mat, map_mat=map_mat, ihc_tile=ihc_tile))
             else:
                 sliding_window_ds = SlidingWindowDataset(data_df=he_slides_w_map, root_path=args.root_path, task_config=args.task_config, slide_key='Matched_HE_SlideName', label=args.label, \
                                     dataset_name=args.test_dataset, folds=args.test_fold,
@@ -697,33 +740,35 @@ def create_tile_scores_matching_tiles(window: bool = False, matching_tile: bool 
                     window_name = f'{dir}_{x_min}_{x_max}x_{y_min}_{y_max}y'
                     scores.append(find_matching_score(window_name=window_name, score_mat=score_mat, map_mat=map_mat))
             scores = np.array(scores, dtype=np.float16)
-            print(f'ihc_slide = {ihc_slide}, scores = {scores}')
+            print(f'ihc_slide = {ihc_slide}, scores = {scores}, num_not_nan = {np.sum(~np.isnan(scores.astype(float)))}, slide_label = {slide_label}') # Delete
             
             np.save(save_path, scores)
-        else:
-            slide_dir = next(filter(lambda x: x.startswith(ihc_slide), os.listdir(ihc_tiles_path)))
-            ihc_tiles_dir = os.path.join(ihc_tiles_path, slide_dir)
-            tiles = os.listdir(ihc_tiles_dir)
-            matching_indices = []
-            if not window:
-                for he_idx, tile in enumerate(os.listdir(full_tiles_dir)):
-                    tile_df_row = {'HE_slide': row.Matched_HE_SlideName, 'IHC_slide': ihc_slide, 'HE_tile': tile, 'Slide_label': slide_label, 
-                                   'fold': fold, 'patient_id': patient_id, 'HE_tile_path': os.path.join(full_tiles_dir, tile),
-                                   'HE_features_path': os.path.join(full_tiles_dir.replace('png_tiles', 'gigapath_features'), f'tile_embeds_{dir}.npy'), 'HE_features_tile_index': he_idx} if create_samples_csv else None                    
-                    ihc_tile_index = find_matching_score(tile_name=tile, score_mat=score_mat, map_mat=map_mat, find_tile=True, tiles=tiles, tile_df_row=tile_df_row)
-                    matching_indices.append(ihc_tile_index)
-                    if ihc_tile_index is not None:
-                        tile_df_row['IHC_features_path'], tile_df_row['IHC_features_tile_index'] = os.path.join(labels_path.replace('tile_labels', 'gigapath_features'), slide_dir, f'tile_embeds_{slide_dir}.npy'), ihc_tile_index
-                        tile_df_row['IHC_tile_path'] = os.path.join(ihc_tiles_dir, tile_df_row['IHC_tile'])
-                        tile_df.loc[len(tile_df)] = tile_df_row
-                        if len(tile_df) % 50 == 0:
-                            break
-            
-            matching_indices = np.array(matching_indices, dtype=np.float16)
-            print(f'ihc_slide = {ihc_slide}, matching_indices = {matching_indices}')
-            
-            if not os.path.exists(save_path):
+        else: # matching_tile
+            # if not os.path.exists(save_path):
+                slide_dir = next(filter(lambda x: x.startswith(ihc_slide), os.listdir(ihc_tiles_path)))
+                ihc_tiles_dir = os.path.join(ihc_tiles_path, slide_dir)
+                tiles = os.listdir(ihc_tiles_dir)
+                matching_indices = []
+                if not window:
+                    for he_idx, tile in enumerate(os.listdir(full_tiles_dir)):
+                        tile_df_row = {'HE_slide': row.Matched_HE_SlideName, 'IHC_slide': ihc_slide, 'HE_tile': tile, 'Slide_label': slide_label, 
+                                    'fold': fold, 'patient_id': patient_id, 'HE_tile_path': os.path.join(full_tiles_dir, tile),
+                                    'HE_features_path': os.path.join(full_tiles_dir.replace('png_tiles', 'gigapath_features'), f'tile_embeds_{dir}.npy'), 'HE_features_tile_index': he_idx} if create_samples_csv else None                    
+                        ihc_tile_index = find_matching_score(tile_name=tile, score_mat=None, map_mat=map_mat, find_tile=matching_tile, tiles=tiles, tile_df_row=tile_df_row)
+                        matching_indices.append(ihc_tile_index)
+                        if ihc_tile_index is not None and tile_df_row: # documenting matching indices to a file
+                            tile_df_row['IHC_features_path'], tile_df_row['IHC_features_tile_index'] = os.path.join(labels_path.replace('tile_labels', 'gigapath_features'), slide_dir, f'tile_embeds_{slide_dir}.npy'), ihc_tile_index
+                            tile_df_row['IHC_tile_path'] = os.path.join(ihc_tiles_dir, tile_df_row['IHC_tile'])
+                            tile_df.loc[len(tile_df)] = tile_df_row
+                            if len(tile_df) % 500 == 0:
+                                break
+                
+                matching_indices = np.array(matching_indices, dtype=np.float16)
+                print(f'ihc_slide = {ihc_slide}, matching_indices = {matching_indices}')
+        
                 np.save(save_path, matching_indices)
+            # else:
+            #     print(f'{save_path} already exists, skipping matching tiles for {ihc_slide}')
 
     if create_samples_csv:
         tile_df.to_csv(tile_df_save_path)
@@ -740,10 +785,38 @@ def create_tile_scores_matching_tiles(window: bool = False, matching_tile: bool 
         # np.save(labels_hist_path, hist_values)
         # np.save(labels_hist_path.replace("hist", "bins"), bins_array)
 
+def create_tile_x_min_max():
+    slides_excel_path = os.path.join("workspace", "WSI", "metadata_csvs", "Her2_slides_matched_HE_folds_infer_15_05_25.csv")
+    df = pd.read_csv(slides_excel_path)
+    he_slides_w_map = df[(df["Path"].str.contains("Batch_1", case=False, na=False)) | (df["Path"].str.contains("Batch_2", case=False, na=False))][["SlideName", "Matched_HE_SlideName", "fold", "label", "patient barcode", "label"]]
+    he_slides_w_map["SlideName"] = he_slides_w_map["SlideName"].apply(lambda x: x.split('.')[0])
+
+    tile_x_path = os.path.join(os.sep, "SSDStorage", "Breast", "Carmel", "Her2", "gigapath_IHC", "tile_x_mpp1")
+    all_tile_x = []
+
+    for row in he_slides_w_map.itertuples(index=True, name="Row"):
+        ihc_slide = row.SlideName
+        save_path = os.path.join(tile_x_path, ihc_slide, "tile_x.npy")
+        if os.path.exists(save_path):
+            tile_x = np.load(save_path)
+            tile_x = torch.from_numpy(tile_x)
+            all_tile_x.append(tile_x.squeeze(0))
+
+    all_tile_x = torch.cat(all_tile_x, dim=0)
+    tile_x_max = all_tile_x.max(dim=-2)[0]
+    tile_x_min = all_tile_x.min(dim=-2)[0]
+
+    np.save(os.path.join(tile_x_path, "tile_x_max.npy"), tile_x_max)
+    np.save(os.path.join(tile_x_path, "tile_x_min.npy"), tile_x_min)
+
 
 def main():
-    create_tile_scores_matching_tiles(matching_tile=True, create_samples_csv=True)
+    # create_tile_scores_matching_tiles(ihc_tile=True)
+    # create_tile_scores_matching_tiles()
+    create_tile_scores_matching_tiles(matching_tile=True) # create_samples_csv=True
     # create_tile_scores(window=True)
+
+    # create_tile_x_min_max()
         
 
     # first_slide_score_mat_path = os.path.join('score_matrices', '21-1518_1_5_d_score_matrix.npz')
@@ -763,155 +836,6 @@ def main():
     # slide_scores_csv_path = os.path.join('excel_files', 'sw_stride1_slide_scores.csv')
     # create_weighted_score_matrices(slide_scores_csv=slide_scores_csv_path)
 
-    # img_coords = torch.tensor([[[10240., 0.],
-    #                       [10496., 0.],
-    #                       [10496., 256.],
-    #                       [10496., 1280.],
-    #                       [10752., 0.],
-    #                       [10752., 256.],
-    #                       [11008., 0.],
-    #                       [11008., 256.]]])
-    # img_coords = torch.tensor([[[40192., 4864.],
-    #                       [40192., 5120.],
-    #                       [40192., 6656.],
-    #                       [40192., 6912.],
-    #                       [40448., 6912.],
-    #                       [40704., 6912.],
-    #                       [40960., 6912.],
-    #                       [41216., 4608.],
-    #                       [41216., 4864.],
-    #                       [41216., 6912.],
-    #                       [41472., 4864.],
-    #                       [41472., 5120.],
-    #                       [41472., 5376.],
-    #                       [41472., 5888.],
-    #                       [41472., 6144.],
-    #                       [41472., 6400.],
-    #                       [41472., 6656.],
-    #                       [41472., 6912.],
-    #                       [41728., 4608.],
-    #                       [41728., 4864.],
-    #                       [41728., 5120.],
-    #                       [41728., 5376.],
-    #                       [41728., 5632.],
-    #                       [41728., 6144.],
-    #                       [41728., 6400.],
-    #                       [41728., 6656.],
-    #                       [41728., 6912.],
-    #                       [41984., 4608.],
-    #                       [41984., 4864.],
-    #                       [41984., 5120.],
-    #                       [41984., 5376.],
-    #                       [41984., 5632.],
-    #                       [41984., 5888.],
-    #                       [41984., 6144.],
-    #                       [41984., 6400.],
-    #                       [41984., 6656.],
-    #                       [41984., 6912.],
-    #                       [42240., 4608.],
-    #                       [42240., 4864.],
-    #                       [42240., 5120.],
-    #                       [42240., 5376.],
-    #                       [42240., 5632.],
-    #                       [42240., 5888.],
-    #                       [42240., 6144.],
-    #                       [42240., 6400.],
-    #                       [42240., 6656.],
-    #                       [42240., 6912.],
-    #                       [42496., 4608.],
-    #                       [42496., 4864.],
-    #                       [42496., 5120.],
-    #                       [42496., 5376.],
-    #                       [42496., 5632.],
-    #                       [42496., 5888.],
-    #                       [42496., 6144.],
-    #                       [42496., 6400.],
-    #                       [42496., 6656.],
-    #                       [42496., 6912.]]])
-    # weighted_score_matrix = torch.zeros((IHC_THUMB_HEIGHT, IHC_THUMB_WIDTH), dtype=torch.float64)
-    # weight_matrix = torch.zeros((IHC_THUMB_HEIGHT, IHC_THUMB_WIDTH), dtype=torch.float64)
-    # patch_weighted_score_matrices(weighted_score_matrix=weighted_score_matrix, weight_matrix=weight_matrix,
-    #                               img_coords=img_coords, window_score=3)
-    # patch_weighted_score_matrices(weighted_score_matrix=weighted_score_matrix, weight_matrix=weight_matrix,
-    #                               img_coords=img_coords, window_score=2)
-    #
-    # final_score_matrix = np.divide(
-    #     weighted_score_matrix.cpu().numpy(),
-    #     weight_matrix.cpu().numpy(),
-    #     out=np.zeros_like(weighted_score_matrix.cpu().numpy()),
-    #     where=weight_matrix.cpu().numpy() > 0  # Avoid division by zero
-    # )
-    # pass
-
-    # **** slide patches extraction ****
-    # he_slide_path = os.path.join('slides_and_thumbs', '21-3263_1_1_e.mrxs')
-    # he_thumb_path = os.path.join('slides_and_thumbs', '0235_0_thumb_21-3263_1_1_e.png')
-    # ihc_slide_path = os.path.join('slides_and_thumbs', '21-3263_1_1_m.mrxs')
-    # ihc_thumb_path = os.path.join('slides_and_thumbs', '0131_0_thumb_21-3263_1_1_m.png')
-    # rotation_mat_path = os.path.join('slides_and_thumbs', 'map_HE_21-3263_1_1_e_to_Her2_21-3263_1_1_m.png')
-    # qupath_he_coords = (16200, 42400)
-    # extract_matching_slide_thumb_patches(he_slide_path=he_slide_path, he_thumb_path=he_thumb_path,
-    #                                      ihc_slide_path=ihc_slide_path, ihc_thumb_path=ihc_thumb_path,
-    #                                      rotation_mat_path=rotation_mat_path, qupath_he_coords=qupath_he_coords)
-
-
-if __name__ == '__main__':
-    main()
-
-
-def indicative_patches():
-    pass
-    # h_e_slide = openslide.OpenSlide(os.path.join('slides_and_thumbs', '21-3263_1_1_e.mrxs'))
-    # mpp_x, mpp_y, x_origin, y_origin = get_mpp_origin(h_e_slide)
-    # tile_coords = np.array([13312, 50432])
-    # slide_patch = h_e_slide.read_region((13312 * 4, 50432 * 4), 2,
-    #                                     (SLIDE_PATCH_SIZE, SLIDE_PATCH_SIZE))
-    # slide_patch.show()
-
-    # h_e_slide = openslide.OpenSlide(os.path.join('slides_to_amit', '20-10015_1_1_e.mrxs'))
-    # h_e_slide = openslide.OpenSlide(os.path.join('slides_to_amit2', 'match_thumbs_HE_Her2', '17-8750_2_10_a.mrxs'))
-    # h_e_slide = openslide.OpenSlide(os.path.join('slides_to_amit2', 'match_thumbs_HE_Her2', '21-163_3_9_d.mrxs'))
-    # h_e_slide = openslide.OpenSlide(os.path.join('slides_to_amit2', 'match_thumbs_HE_Her2', '21-2644_1_1_e.mrxs'))
-
-    # h_e_slide = openslide.open_slide(os.path.join('slides_to_amit2', 'match_thumbs_HE_Her2', '21-3263_1_1_e.mrxs'))
-
-    # thumb = Image.open(os.path.join('slides_to_amit', '0081_0_thumb_20-10015_1_1_e.jpg'))
-    # thumb = Image.open(os.path.join('slides_to_amit2', 'match_thumbs_HE_Her2', '0030_0_thumb_17-8750_2_10_a.jpg'))
-    # thumb = Image.open(os.path.join('slides_to_amit2', 'match_thumbs_HE_Her2', '0053_0_thumb_21-163_3_9_d.jpg'))
-    # thumb = Image.open(os.path.join('slides_to_amit2', 'match_thumbs_HE_Her2', '0173_0_thumb_21-2644_1_1_e.png'))
-
-    # qupath_location = (5500, 28750)  # 20-10015 slides
-    # qupath_location = (5500, 28000)  # 20-10015 slides
-    # qupath_location = (5000, 26500)  # 20-10015 slides
-
-    # qupath_location = (4300, 29100)  # 17-8750 slides
-    # qupath_location = (4150, 29000)  # 17-8750 slides
-    # qupath_location = (2975, 29270)  # 17-8750 slides
-    # qupath_location = (4700, 31000)  # 17-8750 slides
-    # qupath_location = (5200, 33700)  # 17-8750 slides
-    # qupath_location = (7850, 36100)  # 17-8750 slides
-    # qupath_location = (11400, 30700)  # 17-8750 slides
-    # qupath_location = (12230, 30880)  # 17-8750 slides
-
-    # qupath_location = (16000, 10900)  # 21-163 slides
-    # qupath_location = (3900, 12250)  # 21-163 slides
-    # qupath_location = (8650, 6800)  # 21-163 slides
-    # qupath_location = (7500, 16700)  # 21-163 slides
-    # qupath_location = (6700, 16650)  # 21-163 slides
-
-    # qupath_location = (7400, 30800)  # 21-2644 slides
-
-    # qupath_location = (13800, 33500)  # 21-3263 slides
-    # qupath_location = (10200, 41400)  # 21-3263 slides
-
-    # width = int(h_e_slide.properties.get(openslide.PROPERTY_NAME_BOUNDS_WIDTH))
-    # height = int(h_e_slide.properties.get(openslide.PROPERTY_NAME_BOUNDS_HEIGHT))
-
-    # x_end, y_end = h_e_slide.level_dimensions[0]
-    # # The following should hold:
-    # x_end_validation = x_origin + width
-    # y_end_validation = y_origin + height
-
     # rotation_img = cv2.imread(os.path.join('slides_to_amit', 'map_HE_20-10015_1_1_e_to_Her2_20-10015_1_1_m.png'), cv2.IMREAD_UNCHANGED)
     # rotation_img = cv2.imread(os.path.join('slides_to_amit2', '17-8750_2_10', 'map_HE_17-8750_2_10_a_to_Her2_17-8750_2_10_d.png'), cv2.IMREAD_UNCHANGED)
     # rotation_img = cv2.imread(os.path.join('slides_to_amit2', 'match_thumbs_HE_Her2', 'map_HE_17-8750_2_10_a_labeled_to_Her2_17-8750_2_10_d_labeled.png'), cv2.IMREAD_UNCHANGED)
@@ -928,3 +852,7 @@ def indicative_patches():
     # ihc_thumb = Image.open(os.path.join('slides_to_amit2', 'match_thumbs_HE_Her2', '0000_0_thumb_17-8750_2_10_d.jpg'))
     # ihc_thumb = Image.open(os.path.join('slides_to_amit2', 'match_thumbs_HE_Her2', '0028_0_thumb_21-163_3_9_f.jpg'))
     # ihc_thumb = Image.open(os.path.join('slides_to_amit2', 'match_thumbs_HE_Her2', '0093_0_thumb_21-2644_1_1_m.png'))
+
+
+if __name__ == "__main__":
+    main()

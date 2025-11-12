@@ -7,35 +7,24 @@ from PIL import Image
 from PIL import ImageFile
 from tqdm import tqdm
 import cv2
+import math
+import argparse
+import torch
 
 import timm
 import gigapath.slide_encoder as slide_encoder
-from gigapath.pipeline import load_tile_slide_encoder, run_inference_with_tile_encoder, run_inference_with_slide_encoder
 from finetune.utils import map_colors
-from dotenv import load_dotenv
-load_dotenv()
-HF_TOKEN = os.getenv("HF_TOKEN")
+from gigapath.pipeline import load_tile_slide_encoder, run_inference_with_tile_encoder, run_inference_with_slide_encoder
+from finetune.cycle_gan import ResNetGenerator
+from torchvision import transforms
+from torchvision.utils import save_image
+
+# os.environ["HF_TOKEN"] = ""
 
 Image.MAX_IMAGE_PIXELS = None
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 to_colormap = False
 
-
-# Paths
-base_path = "/SSDStorage/Breast/Carmel/Her2/Batch_6/HER2_6/"
-excel_path = os.path.join(base_path, "slides_data_HER2_6.xlsx")
-target_mpp = 1
-segmentation_dir = os.path.join(base_path, "Grids_10")
-process_ind = "5"
-progress_file = os.path.join(base_path, f"progress{process_ind}.txt")
-
-# Set the environment variable for the Hugging Face token
-os.environ["HF_TOKEN"] = os.getenv("HF_TOKEN")
-# load the tile encoder
-tile_encoder = timm.create_model("hf_hub:prov-gigapath/prov-gigapath", pretrained=True)
-# load the slide encoder
-slide_encoder_model = slide_encoder.create_model("hf_hub:prov-gigapath/prov-gigapath", "gigapath_slide_enc12l768d", 1536)
-tile_encoder, slide_encoder_model = load_tile_slide_encoder()
 
 # Function to encode a slide and save its embeddings in the tile and slide level
 def encode_slide(slide_patches_path, slide_name, slide_encoder_model, tile_encoder, output_dir):
@@ -87,25 +76,17 @@ def round_mpp(mpp_value):
     except:
         return None
 
-# Read slide metadata
-try:
-    slides_df = pd.read_excel(excel_path)
-except Exception as e:
-    raise FileNotFoundError(f"Error reading the Excel file: {e}")
+def tiles_overlap(new_coord, existing_coord, tile_size):
+    x_new, y_new = new_coord
+    x_exis, y_exis = existing_coord
+    return ((x_exis <= x_new < x_exis + tile_size) and (y_exis <= y_new < y_exis + tile_size or y_new <= y_exis < y_new + tile_size))
 
-# Check if 'mpp' column exists
-if 'MPP' not in slides_df.columns:
-    raise KeyError(f"Column 'MPP' not found in the Excel file. Available columns: {slides_df.columns.tolist()}")
-
-# Drop rows with null or string 'MPP' values
-slides_df = slides_df.dropna(subset=['MPP'])
-slides_df = slides_df[slides_df['MPP'].apply(lambda x: isinstance(x, (int, float)))]
-
-# Round the 'mpp' column values
-slides_df['MPP'] = slides_df['MPP'].apply(round_mpp)
-
-slides_df = slides_df.dropna(subset=['MPP'])
-slides_df = slides_df[slides_df['MPP'].apply(lambda x: isinstance(x, (int, float)))]
+def remove_overlapping_tiles(coords, tile_size):
+    kept = []
+    for coord in coords:
+        if all(not tiles_overlap(coord, existing, tile_size) for existing in kept):
+            kept.append(coord)
+    return kept
 
 # Function to extract and save patches
 def extract_patches(slide_path, segmentation_path, output_dir, mpp, target_mpp = 0.5):
@@ -131,13 +112,15 @@ def extract_patches(slide_path, segmentation_path, output_dir, mpp, target_mpp =
         
     if len(tiles_coords) == 0:
         return False
+    else:
+        tiles_coords = remove_overlapping_tiles(tiles_coords, tile_size=level_0_output_tile_size)
     
     # Create output directory if it does not exist
     os.makedirs(output_dir, exist_ok=True)
 
     for (x, y) in tiles_coords:
-        for i in range(min(int((mpp_seg / target_mpp)),2)):
-            for j in range(min(int((mpp_seg / target_mpp)),2)):
+        for i in range(min(int(math.ceil(mpp_seg / target_mpp)),2)):
+            for j in range(min(int(math.ceil(mpp_seg / target_mpp)),2)):
                 coord_x = x + i * level_0_output_tile_size
                 coord_y = y + j * level_0_output_tile_size
                 try:
@@ -171,51 +154,167 @@ def find_best_level(mpp, target_mpp, downsample_factors):
     print(mpp * downsample_factors[best_level+1])
     raise "slide level 0 mpp is smaller than target"
 
-# Load progress if it exists
-if os.path.exists(progress_file):
-    with open(progress_file, 'r') as f:
-        start_index = int(f.read().strip())
-else:
-    start_index = 0
-end_file = os.path.join(base_path, f"end{process_ind}.txt")
-if os.path.exists(end_file):
-    with open(end_file, 'r') as f:
-        end_index = int(f.read().strip())
-else:
-    end_index = None
+def generate_synth_ihc(slide_name, output_dir_patches, output_dir_features, g_HE_IHC, tile_encoder, args):
+    patches_names = [img for img in os.listdir(output_dir_patches) if img.endswith('.png')]
+    image_paths = [os.path.join(output_dir_patches, img) for img in patches_names]
+    output_dir_syn_patches = output_dir_patches.replace('png_tiles', 'synth_ihc_tiles')
+    output_dir_syn_features = output_dir_features.replace('gigapath_features', 'synth_ihc_gigapath_features')
+    os.makedirs(output_dir_syn_patches, exist_ok=True)
+    os.makedirs(output_dir_syn_features, exist_ok=True)
 
-slides_df = slides_df[start_index:end_index]
+    tile_bsz = 16
+    transform = transforms.Compose([transforms.ToTensor()])
+    syn_img_tensor_list = []
+    # Generate synthetic IHC images from HE images
+    tiles = torch.stack([transform(Image.open(img_path).convert('RGB')) for img_path in image_paths]).to(args.device)
+    with torch.no_grad():
+        for i in range(0, len(tiles), tile_bsz):
+            curr_tiles = tiles[i:i+tile_bsz]
+            syn_img_tensor = g_HE_IHC(curr_tiles)
+            syn_img_tensor_list.append(syn_img_tensor.cpu())
+    syn_img_tensor = torch.cat(syn_img_tensor_list, dim=0)
+    for i, patch_name in zip(range(syn_img_tensor.shape[0]), patches_names):
+        save_image(syn_img_tensor[i] * 0.5 + 0.5, os.path.join(output_dir_syn_patches, f"{patch_name}"))
+    
+    # Run inference with the tile encoder on the synthetic IHC images
+    syn_image_paths = [os.path.join(output_dir_syn_patches, img) for img in os.listdir(output_dir_syn_patches) if img.endswith('.png')]
+    tile_encoder_outputs = run_inference_with_tile_encoder(syn_image_paths, tile_encoder)
+    # Save the tile embeddings
+    np.save(os.path.join(output_dir_syn_features, f"tile_embeds_{slide_name}.npy"), tile_encoder_outputs['tile_embeds'])
 
-# Process each slide with progress tracking and saving
-for idx, row in tqdm(slides_df.iterrows(), total=len(slides_df), initial=start_index):
-    slide_file = row['file']
-    slide_path = os.path.join(base_path, slide_file)
-    if not os.path.exists(slide_path):
-        print(f"slide: {slide_path} missing, skipping")
-        with open(progress_file, 'w') as f:
-            f.write(str(idx + 1))
-        continue
-    suffix = '_colormapped' if to_colormap else ''
-    suffix += f'_mpp{target_mpp}' if target_mpp != 0.5 else ''
-    slide_name = os.path.splitext(slide_file)[0]
-    segmentation_path = os.path.join(segmentation_dir, f"{slide_name}--tlsz256.data")
-    output_dir_patches = os.path.join(base_path, f'png_tiles{suffix}', slide_name)
-    output_dir_features = os.path.join(base_path, f'gigapath_features{suffix}', slide_name)
+
+def main():
+    # Argument parser
+    parser = argparse.ArgumentParser(description="Search and replace file names and content based on Excel mapping.")
+    parser.add_argument('-b', '--base_path', type=str, help='Slide files path', required=True)
+    parser.add_argument('-s', '--save_path', type=str, help='Path to save tiles and embeds', required=True)
+    parser.add_argument('-e', '--excel_path', type=str, help='Slides excel path', required=True)
+    parser.add_argument('-g', '--generate_synth_ihc', action='store_true', default=False, help='Use cycle GAN to generate synthetic IHC images from HE images')
+    parser.add_argument('-sf', '--synth_fold', type=int, help='Fold to generate synthetic IHC images from HE images', choices=[1, 2, 3, 4, 5, 6], default=-1)
+    parser.add_argument('-gckpt', '--gan_ckpt', type=str, help='Checkpoint for the GAN model')
+    parser.add_argument('-mpp', '--mpp', type=float, default=1, help='Target MPP to extract patches with')
+
+    args = parser.parse_args()
+    print(f'args = {args}')
+
+    # set the device
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    args.device = device
+    
+    # Paths
+    # base_path = "/SSDStorage/Breast/Carmel/Her2/Batch_2/HER2_2/"
+    # excel_path = os.path.join(base_path, "slides_data_HER2_2.xlsx")
+    # base_path = "/data/Breast/Carmel/9-11/Batch_11/CARMEL11/"
+    base_path = args.base_path
+    # excel_path = os.path.join(base_path, "slides_data_CARMEL9.xlsx")
+    # excel_path = "/home/amitf/workspace/WSI/metadata_csvs/Her2_slides_matched_HE_folds_HE.csv"
+    excel_path = args.excel_path
+    save_path = args.save_path
+    target_mpp = args.mpp if args.mpp % 1 != 0 else int(args.mpp) # 2 # 1 
+    print(f"Extracting patches at {target_mpp} mpp")
+    segmentation_dir = os.path.join(base_path, "Grids_10")
+    process_ind = "5"
+    progress_file = os.path.join(base_path, f"progress{process_ind}.txt")
+
+    # Set the environment variable for the Hugging Face token
+    os.environ["HF_TOKEN"] = os.getenv("HF_TOKEN")
+    # load the tile encoder
+    tile_encoder = timm.create_model("hf_hub:prov-gigapath/prov-gigapath", pretrained=True)
+    # load the slide encoder
+    slide_encoder_model = slide_encoder.create_model("hf_hub:prov-gigapath/prov-gigapath", "gigapath_slide_enc12l768d", 1536)
+    tile_encoder, slide_encoder_model = load_tile_slide_encoder()
+
+    # Read slide metadata
     try:
-        if not extract_patches(slide_path, segmentation_path, output_dir_patches, row['MPP'], target_mpp):
-            print(f"slide: {slide_path} has no legitimate tiles, skipping")
+        if excel_path.endswith('.xlsx'):
+            slides_df = pd.read_excel(excel_path)
+        else:
+            slides_df = pd.read_csv(excel_path)
+    except Exception as e:
+        raise FileNotFoundError(f"Error reading the Excel file: {e}")
+
+    # Check if 'mpp' column exists
+    if 'MPP' not in slides_df.columns:
+        raise KeyError(f"Column 'MPP' not found in the Excel file. Available columns: {slides_df.columns.tolist()}")
+
+    # Drop rows with null or string 'MPP' values
+    slides_df = slides_df.dropna(subset=['MPP'])
+    slides_df = slides_df[slides_df['MPP'].apply(lambda x: isinstance(x, (int, float)))]
+
+    # Round the 'mpp' column values
+    slides_df['MPP'] = slides_df['MPP'].apply(round_mpp)
+
+    slides_df = slides_df.dropna(subset=['MPP'])
+    slides_df = slides_df[slides_df['MPP'].apply(lambda x: isinstance(x, (int, float)))]
+
+    # Load progress if it exists
+    if os.path.exists(progress_file):
+        with open(progress_file, 'r') as f:
+            start_index = int(f.read().strip())
+    else:
+        start_index = 0
+    end_file = os.path.join(base_path, f"end{process_ind}.txt")
+    if os.path.exists(end_file):
+        with open(end_file, 'r') as f:
+            end_index = int(f.read().strip())
+    else:
+        end_index = None
+        # end_index = 890
+
+    slides_df = slides_df[start_index:end_index]
+
+    if args.synth_fold != -1:
+        # Filter slides from the specified fold
+        slides_df = slides_df[slides_df['fold'] == args.synth_fold]
+        print(f"Using fold {args.synth_fold} with {len(slides_df)} slides.")
+
+    if args.generate_synth_ihc:
+        g_HE_IHC = ResNetGenerator().to(args.device)
+        g_HE_IHC.load_state_dict(torch.load(args.gan_ckpt), strict=False)
+
+    # Process each slide with progress tracking and saving
+    for idx, row in tqdm(slides_df.iterrows(), total=len(slides_df), initial=start_index):
+        slide_file = row['file']
+        # if not slide_file.startswith('21-6922'): 
+        #     continue
+        slide_path = os.path.join(base_path, slide_file)
+        if not os.path.exists(slide_path):
+            print(f"slide: {slide_path} missing, skipping")
             with open(progress_file, 'w') as f:
                 f.write(str(idx + 1))
             continue
-    except:
-        print(f"couldn't extract patches from slide: {slide_path}")
-        raise
-    encode_slide(output_dir_patches, slide_name, slide_encoder_model, tile_encoder, output_dir_features)
-    
-    # Save progress
-    with open(progress_file, 'w') as f:
-        f.write(str(idx + 1))
+        suffix = '_colormapped' if to_colormap else ''
+        suffix += f'_mpp{target_mpp}' if target_mpp != 0.5 else ''
+        slide_name = os.path.splitext(slide_file)[0]
+        segmentation_path = os.path.join(segmentation_dir, f"{slide_name}--tlsz256.data")
+        output_dir_patches = os.path.join(save_path, f'png_tiles{suffix}', slide_name)
+        output_dir_features = os.path.join(save_path, f'gigapath_features{suffix}', slide_name)
+        if args.generate_synth_ihc:
+            generate_synth_ihc(slide_name, output_dir_patches, output_dir_features, g_HE_IHC, tile_encoder, args)
+        else:
+            if os.path.exists(output_dir_features): 
+                print(f"{output_dir_features} already exists, skipping")
+                continue
+            else:
+                try:
+                    if not extract_patches(slide_path, segmentation_path, output_dir_patches, row['MPP'], target_mpp):
+                        print(f"slide: {slide_path} has no legitimate tiles, skipping")
+                        with open(progress_file, 'w') as f:
+                            f.write(str(idx + 1))
+                        continue
+                except:
+                    print(f"couldn't extract patches from slide: {slide_path}")
+                    raise
+                encode_slide(output_dir_patches, slide_name, slide_encoder_model, tile_encoder, output_dir_features)
+        
+        # Save progress
+        with open(progress_file, 'w') as f:
+            f.write(str(idx + 1))
 
-# Delete the progress file after completion
-if os.path.exists(progress_file):
-    os.remove(progress_file)
+    # Delete the progress file after completion
+    if os.path.exists(progress_file):
+        os.remove(progress_file)
+
+
+if __name__ == '__main__':
+    main()

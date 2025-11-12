@@ -8,13 +8,11 @@ from params import get_finetune_params
 from task_configs.utils import load_task_config
 from utils import seed_torch, get_exp_code, get_loader, save_obj, get_test_loader
 from datasets.slide_datatset import SlideDataset, SlidingWindowDataset
-from dotenv import load_dotenv
-load_dotenv()
-HF_TOKEN = os.getenv("HF_TOKEN")
 
 if __name__ == '__main__':
     # Set the hf token
-    os.environ["HF_TOKEN"] = os.getenv("HF_TOKEN")
+    with open("/home/amitf/workspace/Gigapath_GIP/finetune/hf_token.txt", "r") as file:
+        os.environ["HF_TOKEN"] = file.read()
 
     args = get_finetune_params()
     print(args)

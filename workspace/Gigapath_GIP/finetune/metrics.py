@@ -97,6 +97,8 @@ def calculate_metrics_with_task_cfg(probs: np.array, labels: np.array, task_cfg:
     if task_setting == 'multi_label':
         return calculate_multilabel_metrics(probs, labels, task_cfg['label_dict'], add_metrics)
     else:
+        if task_cfg['name'] == 'her2_multi_class' and 0.5 in task_cfg['label_dict']:
+            task_cfg['label_dict'].pop(0.5)
         return calculate_multiclass_or_binary_metrics(probs, labels, task_cfg['label_dict'], add_metrics)
 
 
@@ -111,8 +113,8 @@ if __name__ == '__main__':
         [0.1, 0.2, 0.7]])
 
     # make labels into one-hot
-    labels = np.array([0, 0, 1, 1, 2, 2])
-    labels = np.eye(3)[labels]
+    labels = np.array([0, 1, 1, 1, 0, 0])
+    # labels = np.eye(3)[labels]
     print(calculate_multiclass_or_binary_metrics(probs, labels, label_dict))
 
     import yaml

@@ -5,6 +5,8 @@ import pandas as pd
 import numpy as np
 
 from torch.utils.data import Dataset
+from PIL import Image
+from torchvision import transforms
 
 
 class SlideDatasetForTasks(Dataset):
@@ -42,19 +44,25 @@ class SlideDatasetForTasks(Dataset):
         self.task_cfg = task_config
         self.label = label
         self.teacher_label = kwargs['teacher_label'] if 'teacher_label' in kwargs else None
+        self.comp_power = kwargs['comp_power'] if 'comp_power' in kwargs else None
+        self.cycle_gan_train = kwargs['cycle_gan_train'] if 'cycle_gan_train' in kwargs else None
+        self.synth_ihc_train = kwargs['synth_ihc_train'] if 'synth_ihc_train' in kwargs else None
+        self.val_fold = kwargs['val_fold'] if 'val_fold' in kwargs else None
         self.use_clinical_features = use_clinical_features
         self.test_on_all = test_on_all
         self.censoreship = censoreship
         self.survival = survival
+        self.folds = folds
         #TODO: update list of columns of clinical features
         self.columns = ['er_status', 'pr_status', 'TumorSize', 'age']
         #self.columns = ['er_status', 'pr_status', 'TumorSize', 'RecChemo', 'age']
         allowed_values = {'er_status': [0,1], 'pr_status':[0,1], 'RecChemo':[0,1]}
-        if 'batches' in kwargs:
-            self.batches = kwargs['batches']
-        if 'slide_path_key' in kwargs:
-            self.slide_path_key = kwargs['slide_path_key']
+        
+        self.batches = kwargs['batches'] if 'batches' in kwargs else None
+        self.oversample = kwargs['oversample'] if 'oversample' in kwargs else None
+        self.slide_path_key = kwargs['slide_path_key'] if 'slide_path_key' in kwargs else None
         self.window_training = kwargs['window_training'] if 'window_training' in kwargs else None
+        self.use_tile_classification = kwargs['use_tile_classification'] if 'use_tile_classification' in kwargs else None
         try:
             data_df[slide_key] = data_df[slide_key].str.removesuffix('.svs')
             data_df[slide_key] = data_df[slide_key].str.removesuffix('.mrxs')
@@ -84,6 +92,33 @@ class SlideDatasetForTasks(Dataset):
             #data_df = data_df[data_df[label].isin([0,1,0.0,1.0])]
             if self.batches is not None and self.slide_path_key is not None:
                 data_df = data_df[data_df[self.slide_path_key].str.contains('|'.join(self.batches), na=False)]
+            if self.oversample:
+                # print(f'self.oversample: {self.oversample}')
+                # data_df = data_df[data_df[self.label] != 0.5]
+
+                label_counts = data_df[self.label].value_counts()
+                label_count_dict = label_counts.to_dict()
+                norm_label_counts = data_df[self.label].value_counts(normalize=True).sort_index()
+                print("Normalized label proportions:\n", norm_label_counts)
+
+                # Step 2: Find the minimum count (for undersampling)
+                min_count = label_counts.min()
+                print(f'min_count: {min_count}')
+
+                # # Step 3: oversample each class to have min_count samples
+                # label_count_dict[0] = int(label_count_dict[0] * 0.75)
+                # label_count_dict[0] = int(label_count_dict[0] * 0.1)
+                label_count_dict[1] = int(label_count_dict[1] * 9) # 0.25
+                # label_count_dict[2] = int(label_count_dict[2] * 1) # 3.5
+                # label_count_dict[3] = int(label_count_dict[3] * 1) # 3.5
+
+                # Sample accordingly
+                data_df = data_df.groupby(self.label, group_keys=False) \
+                .apply(lambda x: x.sample(n=label_count_dict.get(x.name, len(x)), replace=True) if x.name in [0, 1, 2, 3] \
+                       else x.sample(n=label_count_dict.get(x.name, len(x))))
+
+                norm_label_counts = data_df[self.label].value_counts(normalize=True).sort_index()
+                print("Normalized label proportions after oversampling:\n", norm_label_counts)
 
             if not test_on_all:
                 data_df = data_df[pd.to_numeric(data_df[label], errors='coerce').notnull()]
@@ -109,7 +144,7 @@ class SlideDatasetForTasks(Dataset):
                 if column in allowed_values:
                     data_df = data_df[data_df[column].isin(allowed_values[column])]
             
-            
+        print(f'data_df unique labels: {data_df[self.label].unique()}')
         # set up the task
         self.setup_data(data_df, task_config.get('setting', 'multi_class'))
 
@@ -174,7 +209,8 @@ class SlideDatasetForTasks(Dataset):
         # set up the mappings
         assert self.label in df.columns, 'No label column found in the dataframe'
         df[self.label] = df[self.label].map(label_dict)
-        n_classes = len(label_dict)
+        # n_classes = len(label_dict)
+        n_classes = len(set(label_dict.values()))
         
         images = df[self.slide_key].to_list()
         labels = df[[self.label]].to_numpy().astype(int)
@@ -298,36 +334,118 @@ class SlideDataset(SlideDatasetForTasks):
                 coords_files = os.listdir(coords_path)
             # The coords files are named in the format <x coord>x_<y coord>y.jpg, so we split by x_ and y and convert to int
             coords = torch.tensor([[int(coord.split('x_')[0]), int(coord.split('x_')[1].split('y')[0])] for coord in coords_files])
+            if self.cycle_gan_train:
+                transform = transforms.Compose([transforms.ToTensor()])
+                tiles = torch.stack([transform(Image.open(os.path.join(coords_path, tile)).convert('RGB')) for tile in coords_files])
+            else:
+                tiles = None
 
             # Get local_labels
             tile_labels_path = os.path.join(os.sep, "SSDStorage", "Breast", "Carmel", "Her2", "gigapath_IHC", f"tile_labels{path[-1]}", "tile_scores.npy")
             window_labels_path = os.path.join(os.sep, "SSDStorage", "Breast", "Carmel", "Her2", "gigapath_IHC", f"window_labels{path[-1]}", "window_scores.npy")
             local_labels_path = window_labels_path if self.window_training else tile_labels_path
+            tile_y_path = os.path.join(os.sep, "SSDStorage", "Breast", "Carmel", "Her2", "gigapath_IHC", f"tile_y{path[-1]}", f"tile_y_val{self.val_fold}.npy")
+            tile_x_dir = f"tile_x_cos_2_{self.comp_power}"
+            # print(f'tile_x_dir: {tile_x_dir}')
+            tile_x_path = os.path.join(os.sep, "SSDStorage", "Breast", "Carmel", "Her2", "gigapath_IHC", f"{tile_x_dir}{path[-1]}", "tile_x.npy")
+            tile_reg_x_path = os.path.join(os.sep, "SSDStorage", "Breast", "Carmel", "Her2", "gigapath_IHC", f"tile_cos_reg_x{path[-1]}", "tile_reg_x.npy")
             ihc_images = None
             ihc_coords = None
+            ihc_tiles = None
             matching_tiles = None
-            if "gigapath_CAT_features" in img_path:
+            tumor_indices = None
+            non_tumor_indices = None
+            tile_y = None
+            tile_x = None
+            tile_reg_x = None
+            synth_ihc_imgs = None
+            if "gigapath_CAT_features" in img_path or "gigapath_HE" in img_path or "gigapath_cancer" in img_path:
                 try:
                     he_slide_dir = os.path.dirname(img_path)
-                    ihc_imgs_path = he_slide_dir.replace("gigapath_CAT_features", "Carmel/Her2/gigapath_IHC")[:-1]
+                    he_slide = he_slide_dir.split('/')[-1]
+                    ihc_imgs_path = he_slide_dir.replace("gigapath_CAT_features", "Carmel/Her2/gigapath_IHC").replace('HE', 'IHC')[:-1]
                     block = ihc_imgs_path.split('/')[-1]
                     matching_slide = next(filter(lambda x: x.startswith(block), os.listdir(os.path.dirname(ihc_imgs_path))))
                     ihc_imgs_path = ihc_imgs_path.replace(block, matching_slide)
+                    tile_x_path = tile_x_path.replace(he_slide, matching_slide)
                     full_path = os.path.join(ihc_imgs_path, f"tile_embeds_{matching_slide}.npy")
-                    ihc_images = np.load(full_path) # load the numpy file
-                    ihc_images = torch.from_numpy(ihc_images) # convert to tensor
                     ihc_coords_path = ihc_imgs_path.replace('gigapath_features', 'png_tiles')
                     ihc_coords_files = os.listdir(ihc_coords_path)
                     # The coords files are named in the format <x coord>x_<y coord>y.jpg, so we split by x_ and y and convert to int
                     ihc_coords = torch.tensor([[int(coord.split('x_')[0]), int(coord.split('x_')[1].split('y')[0])] for coord in ihc_coords_files])
+                    if self.cycle_gan_train:
+                        ihc_tiles = torch.stack([transform(Image.open(os.path.join(ihc_coords_path, tile)).convert('RGB')) for tile in ihc_coords_files])
 
-                    matching_tiles_dir = he_slide_dir.replace("gigapath_CAT_features", "Carmel/Her2/gigapath_IHC").replace('gigapath_features', 'matching_tiles')
+                    matching_tiles_dir = he_slide_dir.replace("gigapath_CAT_features", "Carmel/Her2/gigapath_IHC").replace('HE', 'IHC').replace('gigapath_features', 'matching_tiles')
                     matching_tiles_file = os.path.join(matching_tiles_dir, 'ihc_tiles.npy')
-                    matching_tiles = np.load(matching_tiles_file) # load the numpy file
-                    matching_tiles = torch.from_numpy(matching_tiles) # convert to tensor
-                except BaseException as e:
+
+                    tumor_indices_dir = matching_tiles_dir.replace('matching_tiles', 'tumor_indices')
+                    if "gigapath_cancer" in img_path:
+                        tumor_indices_dir = he_slide_dir.replace("gigapath_features", "tumor_indices")
+                        print(f'tumor_indices_dir: {tumor_indices_dir}')
+                        tumor_indices_file = os.path.join(tumor_indices_dir, 'tumor_ann_indices.npy')
+                        non_tumor_indices_file = os.path.join(tumor_indices_dir, 'non_tumor_indices.npy')
+                    else:
+                        tumor_indices_file = os.path.join(tumor_indices_dir, f'tumor_indices{self.val_fold}.npy')
+
+                    try:
+                        ihc_images = np.load(full_path) # load the numpy file
+                        ihc_images = torch.from_numpy(ihc_images) # convert to tensor
+                    except BaseException as e:
+                        print(e)
+                        pass
+                    
+                    try:
+                        matching_tiles = np.load(matching_tiles_file) # load the numpy file
+                        matching_tiles = torch.from_numpy(matching_tiles) # convert to tensor
+                    except BaseException as e:
+                        print(e)
+                        pass
+
+                    try:
+                        tile_y = np.load(tile_y_path) # load the numpy file
+                        tile_y = torch.from_numpy(tile_y) # convert to tensor
+                    except BaseException as e:
+                        print(e)
+                        pass
+                    
+                    try:
+                        tile_x = np.load(tile_x_path) # load the numpy file
+                        tile_x = torch.from_numpy(tile_x) # convert to tensor
+                    except BaseException as e:
+                        print(e)
+                        pass
+
+                    try:
+                        tile_reg_x = np.load(tile_reg_x_path) # load the numpy file
+                        tile_reg_x = torch.from_numpy(tile_reg_x) # convert to tensor
+                    except BaseException as e:
+                        print(e)
+                        pass
+
+                    try:
+                        tumor_indices = np.load(tumor_indices_file) # load the numpy file
+                        tumor_indices = torch.from_numpy(tumor_indices) # convert to tensor
+                        non_tumor_indices = np.load(non_tumor_indices_file) # load the numpy file
+                        non_tumor_indices = torch.from_numpy(non_tumor_indices) # convert to tensor
+                    except BaseException as e:
+                        print(e)
+                        pass
+
+                    if self.synth_ihc_train:
+                        try:
+                            synth_ihc_imgs_path = img_path.replace('gigapath_features_mpp2', 'synth_ihc_gigapath_features_mpp2')
+                            synth_ihc_imgs = np.load(synth_ihc_imgs_path) # load the numpy file
+                            synth_ihc_imgs = torch.from_numpy(synth_ihc_imgs) # convert to tensor
+                        except BaseException as e:
+                            print(e)
+                            pass
+                    
+                except BaseException as e:  
                     print(e)
                     pass
+            else: # ihc_tile training
+                local_labels_path = local_labels_path.replace('tile_labels', 'ihc_tile_labels')
             try:
                 local_labels = np.load(local_labels_path) # load the numpy file
                 local_labels = torch.from_numpy(local_labels) # convert to tensor
@@ -338,12 +456,20 @@ class SlideDataset(SlideDatasetForTasks):
         # set the input dict
         data_dict = {'imgs': images,
                 'ihc_imgs': ihc_images,
+                'synth_ihc_imgs': synth_ihc_imgs,
                 'img_lens': images.size(0),
                 'pad_mask': 0,
                 'coords': coords,
                 'ihc_coords': ihc_coords,
                 'local_labels': local_labels,
-                'matching_tiles': matching_tiles}
+                'matching_tiles': matching_tiles,
+                'tumor_indices': tumor_indices,
+                'non_tumor_indices': non_tumor_indices,
+                'tiles': tiles,
+                'ihc_tiles': ihc_tiles,
+                'tile_y': tile_y,
+                'tile_x': tile_x,
+                'tile_reg_x': tile_reg_x}
         return data_dict
     
     def get_one_sample(self, idx: int) -> dict:
@@ -375,16 +501,27 @@ class SlideDataset(SlideDatasetForTasks):
         label = torch.from_numpy(self.labels[idx])
         # add teacher labels
         teacher_label = torch.from_numpy(self.teacher_labels[idx]) if self.teacher_label is not None else None # Delete
+
+        # if self.use_tile_classification and self.oversample:
+        #     self.shuffle_indices(data_dict, slide_id)
         
         # set the sample dict
         sample = {'imgs': data_dict['imgs'],
                   'ihc_imgs': data_dict['ihc_imgs'],
+                  'synth_ihc_imgs': data_dict['synth_ihc_imgs'],
                   'img_lens': data_dict['img_lens'],
                   'pad_mask': data_dict['pad_mask'],
                   'coords': data_dict['coords'],
                   'ihc_coords': data_dict['ihc_coords'],
                   'local_labels': data_dict['local_labels'],
                   'matching_tiles': data_dict['matching_tiles'],
+                  'tumor_indices': data_dict['tumor_indices'],
+                  'non_tumor_indices': data_dict['non_tumor_indices'],
+                  'tiles': data_dict['tiles'],
+                  'ihc_tiles': data_dict['ihc_tiles'],
+                  'tile_y': data_dict['tile_y'],
+                  'tile_x': data_dict['tile_x'],
+                  'tile_reg_x': data_dict['tile_reg_x'],
                   'slide_id': slide_id,
                   'labels': label,
                   'teacher_labels': teacher_label,
@@ -397,7 +534,8 @@ class SlideDataset(SlideDatasetForTasks):
             try:
                 sample = self.get_one_sample(idx)
                 return sample
-            except:
+            except BaseException as e:
+                print(f'Error in getting sample {idx}: {e}')
                 raise
                 print('Error in getting the sample, try another index')
                 idx = np.random.randint(0, len(self.slide_data))
@@ -447,6 +585,18 @@ class SlideDataset(SlideDatasetForTasks):
         self.images = [self.images[i] for i in reordered_indices]
         self.labels = self.labels[reordered_indices]
         self.slide_data = self.slide_data.iloc[reordered_indices]
+
+    def shuffle_indices(self, data_dict, slide_id):
+        '''Shuffle the indices of the data_dict'''
+        if self.use_tile_classification and data_dict['imgs'] is not None and data_dict['local_labels'] is not None:
+            indices = torch.randperm(data_dict['imgs'].size(0))
+            data_dict['imgs'] = data_dict['imgs'][indices]
+            data_dict['coords'] = data_dict['coords'][indices]
+            if 'local_labels' in data_dict:
+                data_dict['local_labels'] = data_dict['local_labels'][indices]
+            if 'matching_tiles' in data_dict:
+                data_dict['matching_tiles'] = data_dict['matching_tiles'][indices]
+            print(f'Shuffled {data_dict["imgs"].size(0)} tiles for slide {slide_id}')
         
         
     def __len__(self):
@@ -497,6 +647,15 @@ class SlidingWindowDataset(Dataset):
     def update_clinical_features_params_and_handle_data(self, model):
         self.slide_dataset.update_clinical_features_params_and_handle_data(model)
         self.generate_windows()
+    
+    def add_slide_bbox(self):
+        slide = openslide.OpenSlide(slide_file)
+        bbox_x = int(slide.properties['openslide.bounds-x'])
+        bbox_y = int(slide.properties['openslide.bounds-y'])
+        for tumor_polygon in tumor_polygons:
+            tumor_polygon[:, 0] += bbox_y
+            tumor_polygon[:, 1] += bbox_x
+
     
     def generate_windows(self):
         sample = self.slide_dataset.__getitem__(0)

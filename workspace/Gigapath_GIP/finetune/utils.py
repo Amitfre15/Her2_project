@@ -1,4 +1,5 @@
 import os
+import re
 import math
 import torch
 import pickle
@@ -11,7 +12,18 @@ import torch.nn.functional as F
 from typing import List, Tuple
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import roc_auc_score, average_precision_score
+from scipy.stats import spearmanr, pearsonr
 from torch.utils.data import DataLoader, Sampler, WeightedRandomSampler, RandomSampler, SequentialSampler, sampler
+
+DESIRED_MPP = 2
+SLIDE_PATCH_SIZE = 256
+SLIDE_MPP = 0.242797397769517
+SLIDE_HEIGHT = 204614
+SLIDE_WIDTH = 89484
+HE_THUMB_HEIGHT = 10230
+HE_THUMB_WIDTH = 4473
+IHC_THUMB_HEIGHT = 5115
+IHC_THUMB_WIDTH = 2237
 
 def map_colors(patches, rate = 1):
     map_file = '/home/shacharcohen/workspace/WSI/legacy/color_map_FinHer2Carmel.csv'
@@ -118,6 +130,7 @@ def slide_collate_fn(samples):
     Return value {imgs: [N, L, 256, 384], pad_mask: [N, L]}'''
     image_list = [s['imgs'] for s in samples]
     ihc_image_list = [s['ihc_imgs'] for s in samples]
+    synth_ihc_image_list = [s['synth_ihc_imgs'] for s in samples]
     img_len_list = [s['imgs'].size(0) for s in samples]
     coord_list = [s['coords'] for s in samples]
     ihc_coord_list = [s['ihc_coords'] for s in samples]
@@ -125,11 +138,25 @@ def slide_collate_fn(samples):
     teacher_label_list = [s['teacher_labels'] for s in samples]
     tile_label_list = [s['local_labels'] for s in samples]
     matching_tiles_list = [s['matching_tiles'] for s in samples]
+    tumor_indices_list = [s['tumor_indices'] for s in samples]
+    non_tumor_indices_list = [s['non_tumor_indices'] for s in samples]
+    tiles_list = [s['tiles'] for s in samples]
+    ihc_tiles_list = [s['ihc_tiles'] for s in samples]
+    tile_y_list = [s['tile_y'] for s in samples]
+    tile_x_list = [s['tile_x'] for s in samples]
+    tile_reg_x_list = [s['tile_reg_x'] for s in samples]
     slide_id_list = [s['slide_id'] for s in samples]
     labels = torch.stack(label_list)
     teacher_labels = torch.stack(teacher_label_list) if teacher_label_list[0] is not None else None # Delete
     local_labels = torch.stack(tile_label_list) if tile_label_list[0] is not None else None
     matching_tiles = torch.stack(matching_tiles_list) if matching_tiles_list[0] is not None else None
+    tumor_indices = torch.stack(tumor_indices_list) if tumor_indices_list[0] is not None else None
+    non_tumor_indices = torch.stack(non_tumor_indices_list) if non_tumor_indices_list[0] is not None else None
+    tiles = torch.stack(tiles_list) if tiles_list[0] is not None else None
+    ihc_tiles = torch.stack(ihc_tiles_list) if ihc_tiles_list[0] is not None else None
+    tile_y = torch.stack(tile_y_list) if tile_y_list[0] is not None else None
+    tile_x = torch.stack(tile_x_list) if tile_x_list[0] is not None else None
+    tile_reg_x = torch.stack(tile_reg_x_list) if tile_reg_x_list[0] is not None else None
     censoreship = [s['censoreship'] for s in samples]
     pad_imgs, pad_coords, pad_mask = pad_tensors(image_list, coord_list)
     
@@ -139,9 +166,15 @@ def slide_collate_fn(samples):
         ihc_pad_imgs, ihc_pad_coords, ihc_pad_mask = res_tuple[0], res_tuple[1], res_tuple[2]
     else:
         ihc_pad_imgs, ihc_pad_coords, ihc_pad_mask = None, None, None
+
+    if synth_ihc_image_list[0] is not None:
+        synth_pad_imgs, _, _ = pad_tensors(synth_ihc_image_list, coord_list)
+    else:
+        synth_pad_imgs = None
     
     data_dict = {'imgs': pad_imgs, 
-            'ihc_imgs': ihc_pad_imgs, 
+            'ihc_imgs': ihc_pad_imgs,
+            'synth_ihc_imgs': synth_pad_imgs,
             'img_lens': img_len_list,
             'coords': pad_coords,
             'ihc_coords': ihc_pad_coords,
@@ -152,6 +185,13 @@ def slide_collate_fn(samples):
             'teacher_labels': teacher_labels,
             'local_labels': local_labels,
             'matching_tiles': matching_tiles,
+            'tumor_indices': tumor_indices,
+            'non_tumor_indices': non_tumor_indices,
+            'tiles': tiles,
+            'ihc_tiles': ihc_tiles,
+            'tile_y': tile_y,
+            'tile_x': tile_x,
+            'tile_reg_x': tile_reg_x,
             'censoreship': censoreship}
     return data_dict
 
@@ -299,6 +339,7 @@ def param_groups_lrd(model, weight_decay=0.05, no_weight_decay_list=[], layer_de
         if 'mask_token' in n or 'slide_encoder.decoder' in n:
             continue
 
+
         # no decay: all 1D parameters and model specific ones
         if p.ndim == 1 or n in no_weight_decay_list:
             g_decay = "no_decay"
@@ -313,6 +354,11 @@ def param_groups_lrd(model, weight_decay=0.05, no_weight_decay_list=[], layer_de
 
         if group_name not in param_group_names:
             this_scale = layer_scales[layer_id]
+            # if n.startswith('classifier'):
+            #     this_scale = 100.0
+            
+            # if n.startswith('tile_classifier'):
+            #     this_scale = 10.0
 
             param_group_names[group_name] = {
                 "lr_scale": this_scale,
@@ -373,7 +419,7 @@ def get_optimizer(args, model):
     if not args.use_tile_classification:
         param_groups = param_groups_lrd(model, args.optim_wd,
             layer_decay=args.layer_decay)    
-    
+        # print(f'param_groups = {param_groups}')
         optimizer = optim_func(param_groups, lr=args.lr)
 
     else:
@@ -453,20 +499,261 @@ class Weighted_MSE_Loss(torch.nn.Module):
     ) -> torch.Tensor:
         return (weights * (y_pred - y_true) ** 2).mean()
 
+
+class PenalizedCELoss(torch.nn.Module):
+    def __init__(self, n_classes, penalty_weight=1.0):
+        """
+        Penalized Cross-Entropy Loss to penalize high logits for distant classes.
+
+        Args:
+            n_classes (int): The number of classes.
+            penalty_weight (float): Weight of the penalty term.
+        """
+        super(PenalizedCELoss, self).__init__()
+        self.n_classes = n_classes
+        self.penalty_weight = penalty_weight
+
+    def forward(self, logits, labels):
+        """
+        Args:
+            logits (torch.Tensor): Predicted logits of shape [N, n_classes].
+            labels (torch.Tensor): True labels of shape [N].
+
+        Returns:
+            torch.Tensor: Combined loss (CE loss + distance penalty).
+        """
+        # Compute the standard Cross-Entropy Loss
+        ce_loss = F.cross_entropy(logits, labels)
+
+        # Create a distance matrix for the classes
+        class_indices = torch.arange(self.n_classes, device=logits.device).float()  # Shape: [n_classes]
+        distance_matrix = torch.abs(class_indices.unsqueeze(0) - class_indices.unsqueeze(1))  # Shape: [n_classes, n_classes]
+
+        # Get the predicted probabilities
+        probs = F.softmax(logits, dim=-1)  # Shape: [N, n_classes]
+
+        # Gather the distances for the true labels
+        true_distances = distance_matrix[labels]  # Shape: [N, n_classes]
+
+        # Compute the penalty term
+        penalty = (probs * true_distances).sum(dim=-1).mean()  # Penalize high probabilities for distant classes
+        print(f'probs * true_distances = {probs * true_distances}')
+
+        # Combine the CE loss and the penalty
+        total_loss = ce_loss + self.penalty_weight * penalty
+        return total_loss
+
+
+class KL_Loss(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+    
+    def forward(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
+        y_pred, y_true = y_pred.float(), y_true.float()
+
+        min_label, max_label = -0.5, 3.5
+        logits_hist = torch.histc(y_pred, bins=20, min=min_label, max=max_label)
+        labels_hist = torch.histc(y_true, bins=20, min=min_label, max=max_label)
+        print(f'logits_hist = {logits_hist}, labels_hist = {labels_hist}')
+
+        # Normalize to get probability distributions
+        logits_dist = logits_hist / logits_hist.sum()
+        labels_dist = labels_hist / labels_hist.sum()
+
+        # Convert to log-probabilities for KLDiv
+        log_logits_dist = torch.log(logits_dist + 1e-8)  # Avoid log(0)
+
+        # Compute KL divergence (from labels → logits)
+        kl_loss = F.kl_div(log_logits_dist, labels_dist, reduction='batchmean')
+        if torch.isnan(kl_loss):
+            print(f'y_pred = {y_pred}, y_true = {y_true}, logits_hist = {logits_hist}, labels_hist = {labels_hist}, log_logits_dist = {log_logits_dist}')
+        return kl_loss
+
+class DifferentiableHistogramKL(torch.nn.Module):
+    def __init__(self, bins=10, min_val=2, max_val=5):
+        super().__init__()
+        self.bins = bins
+        self.min_val = min_val
+        self.max_val = max_val
+        self.bin_width = (max_val - min_val) / bins
+        self.bin_centers = torch.linspace(min_val + self.bin_width / 2, max_val - self.bin_width / 2, bins)
+
+    def forward(self, y_pred, y_true):
+        device = y_pred.device
+        bin_centers = self.bin_centers.to(device)
+
+        def soft_histogram(x):
+            # x: (N,)
+            x = x.view(-1, 1)  # (N, 1)
+            bin_centers_ = bin_centers.view(1, -1)  # (1, B)
+            # Gaussian kernel to approximate histogram binning
+            kernel = torch.exp(-0.5 * ((x - bin_centers_) / self.bin_width)**2)  # (N, B)
+            hist = kernel.sum(dim=0)  # (B,)
+            return hist / hist.sum()  # Normalize to sum to 1
+
+        pred_dist = soft_histogram(y_pred)
+        true_dist = soft_histogram(y_true)
+
+        log_pred = torch.log(pred_dist + 1e-8)
+        kl = F.kl_div(log_pred, true_dist, reduction='batchmean')
+        return kl
+
+
+class MidPenalizedLoss(torch.nn.Module):
+    def __init__(self, base_loss_fn, label_range=(0, 3), penalty_weight=1.0):
+        """
+        Penalized loss to punish predictions near the middle of the label range.
+
+        Args:
+            base_loss_fn: The base loss function (e.g., MSELoss, CrossEntropyLoss).
+            label_range: Tuple indicating the range of labels (e.g., (0, 3)).
+            penalty_weight: Weight of the penalty term.
+        """
+        super(MidPenalizedLoss, self).__init__()
+        self.base_loss_fn = base_loss_fn
+        self.middle = (label_range[0] + label_range[1]) / 2  # Middle of the range
+        self.penalty_weight = penalty_weight
+
+    def forward(self, logits, labels):
+        # Base loss (e.g., MSE or CrossEntropy)
+        base_loss = self.base_loss_fn(logits, labels)
+
+        # Penalize predictions near the middle of the range
+        penalty = torch.abs(logits - self.middle)  # Distance from the middle
+        penalty = 1.0 / (penalty + 1e-8)  # Inverse distance (higher penalty near the middle)
+
+        # Apply the penalty weight
+        penalty_loss = self.penalty_weight * penalty.mean()
+
+        # Combine the base loss and the penalty
+        total_loss = base_loss + penalty_loss
+        return total_loss
+
+
+class CLIPLoss(torch.nn.Module):
+    def __init__(self, num_per_class: int = 500):
+        super(CLIPLoss, self).__init__()
+        self.temperature = torch.nn.Parameter(torch.tensor(1.0))
+        self.num_per_class = num_per_class
+
+    def forward(self, HE_tile_features: torch.Tensor, HE_tile_labels: torch.Tensor, HE_memory: dict) -> torch.Tensor:
+        if HE_tile_features is None or HE_tile_labels is None:
+            return torch.tensor(0.0, device=HE_tile_features.device)
+
+        device = HE_tile_features.device
+        num_samples = min(self.num_per_class, HE_tile_features.size(0))
+        HE_tile_labels = torch.clamp(HE_tile_labels.squeeze(0).round(), min=0, max=3)
+        # HE_tile_labels[HE_tile_labels == 1] = 0
+        # HE_tile_labels[HE_tile_labels == 2] = 1
+        HE_tile_labels[HE_tile_labels == 3] = 1
+        print(f'HE_tile_features.shape = {HE_tile_features.shape}, HE_tile_labels.shape = {HE_tile_labels.shape}')
+        # bucket_ids = torch.clamp(HE_tile_labels, min=0, max=3)
+        bucket_ids = torch.clamp(HE_tile_labels, min=0, max=1)
+        print(f'bucket_ids = {bucket_ids}')
+        bucket_keys = ['0', '1'] # ['0', '1', '2', '3']
+        num_keys = len(bucket_keys)
+
+        # Ensure all memory keys exist
+        for key in bucket_keys:
+            if key not in HE_memory:
+                HE_memory[key] = []
+
+        # Update memory bank with current features (detached, per class)
+        for i, key in enumerate(bucket_keys):
+            mask = (bucket_ids == i).squeeze(0)
+            if mask.any():
+                HE_memory[key].extend([f.detach().cpu() for f in HE_tile_features[mask]])
+                if len(HE_memory[key]) > self.num_per_class * 5:
+                    HE_memory[key] = HE_memory[key][-self.num_per_class * 5:]
+
+        # Check all memory buckets are non-empty before proceeding
+        if any(len(HE_memory[k]) == 0 for k in bucket_keys):
+            return torch.tensor(0.0, device=device)
+
+        # Sample num_samples anchors from current batch
+        anchor_idxs = torch.randperm(HE_tile_features.size(0))[:num_samples]
+        anchors = HE_tile_features[anchor_idxs]
+        anchor_labels = bucket_ids[anchor_idxs]
+
+        all_feats = []
+
+        for anchor, anchor_label in zip(anchors, anchor_labels):
+            anchor_lbl = anchor_label.int().item() # Convert to int for indexing
+            group_feats = [None] * num_keys  # one for each label
+            group_feats[anchor_lbl] = anchor  # place anchor in correct slot
+
+            for lbl in range(num_keys):
+                if lbl == anchor_lbl:
+                    continue
+                lbl_key = str(lbl)
+                sample = random.choice(HE_memory[lbl_key])
+                group_feats[lbl] = sample.to(device)
+
+            all_feats.append(torch.stack(group_feats))  # shape (num_keys, feat_dim)
+
+        all_feats = torch.stack(all_feats, dim=0)  # (num_samples, num_keys, feat_dim)
+
+        # ---- Permute all_feats into all_feats2 with no index i = i ----
+        def generate_derangement(n):
+            while True:
+                idx = torch.randperm(n)
+                if not torch.any(idx == torch.arange(n)):
+                    return idx
+
+        deranged_idx = generate_derangement(num_samples)
+        all_feats2 = all_feats[deranged_idx]  # (num_samples, num_keys, feat_dim)
+
+        print(f'all_feats[0] = {all_feats[0]}, all_feats[0].requires_grad = {all_feats[0].requires_grad}')
+        print(f'all_feats2[0] = {all_feats2[0]}')
+        # Normalize both
+        all_feats = F.normalize(all_feats, dim=2)    # (N, num_keys, D)
+        all_feats2 = F.normalize(all_feats2, dim=2)  # (N, num_keys, D)
+        print(f'all_feats[0] = {all_feats[0]}')
+        print(f'all_feats2[0] = {all_feats2[0]}')
+
+        # Compute logits: (N, num_keys, num_keys)
+        logits = torch.bmm(all_feats, all_feats2.transpose(1, 2)) # * self.temperature.exp()
+        print(f'logits = {logits}')
+
+        # Targets: identity across num_keys positions
+        targets = torch.arange(num_keys, device=device).unsqueeze(0).expand(num_samples, -1)  # (N, num_keys)
+        print(f'logits.shape = {logits.shape}, targets.shape = {targets.shape}')
+
+        # Compute cross-entropy loss for each example in batch
+        loss1 = F.cross_entropy(logits.reshape(-1, num_keys), targets.reshape(-1))
+        loss2 = F.cross_entropy(logits.transpose(1, 2).reshape(-1, num_keys), targets.reshape(-1))
+
+        # # Step 1: Create soft targets of shape (N, 4, 4)
+        # soft_targets = torch.tensor([
+        #     [0.75, 0.25, 0.00, 0.00],
+        #     [0.25, 0.50, 0.25, 0.00],
+        #     [0.00, 0.25, 0.50, 0.25],
+        #     [0.00, 0.00, 0.25, 0.75]
+        # ], device=logits.device).unsqueeze(0).expand(logits.size(0), -1, -1)  # (N, 4, 4)
+
+        # # Step 2: Compute log-probs over last dim
+        # log_probs = F.log_softmax(logits, dim=-1)  # (N, 4, 4)
+        # log_probs_T = F.log_softmax(logits.transpose(1, 2), dim=-1)
+
+        # # Step 3: KL-div between log_probs and soft_targets
+        # loss1 = F.kl_div(log_probs, soft_targets, reduction='batchmean')
+        # loss2 = F.kl_div(log_probs_T, soft_targets, reduction='batchmean')
+
+        return (loss1 + loss2) / 2
+
+
 class Contrastive_Loss(torch.nn.Module):
     def __init__(self):
         super().__init__()
     
     # Contrastive Loss Function (from the provided image)
-    def contrastive_loss(self, dif_class, dist, margin=1):
+    def contrastive_loss(self, dif_class, dist, margin=50):
         loss = ((1 - dif_class) * 0.5 * dist**2 + dif_class * 0.5 * (torch.clamp(margin - dist, min=0) ** 2))
         print(f'loss = {loss}')
 
         return loss.mean()
         
-    def forward(
-        self, embedding_memory: dict, embedding: torch.Tensor, label: torch.Tensor, margin=1
-    ) -> torch.Tensor:
+    def forward(self, embedding_memory: dict, embedding: torch.Tensor, teacher_embedding: torch.Tensor, label: torch.Tensor, margin=50) -> torch.Tensor:
         str_label = str(label.item())
         print(f'str_label = {str_label}')
 
@@ -483,9 +770,14 @@ class Contrastive_Loss(torch.nn.Module):
                 distances = torch.norm(embedding - stored_embs, dim=1)  # Compute distances
 
                 if stored_label == str_label:
-                    pos_samples.append(distances)  # Positive pairs
-                else:
+                    # pos_samples.append(distances)  # Positive pairs
+                    pos_samples.append(torch.norm(embedding - teacher_embedding, dim=1))  # Positive pairs
+                elif str_label in ['2', '3'] and stored_label not in ['2', '3']:
                     neg_samples.append(distances)  # Negative pairs
+                elif str_label in ['0', '0.5', '1'] and stored_label not in ['0', '0.5', '1']:
+                    neg_samples.append(distances)
+                else:
+                    pass  
 
             # Compute losses if we have pairs
             if pos_samples:
@@ -503,18 +795,42 @@ class Contrastive_Loss(torch.nn.Module):
         # Update memory bank (keep last N embeddings per label)
         if str_label not in embedding_memory:
             embedding_memory[str_label] = []
-        embedding_memory[str_label].append(embedding.detach().squeeze(0))  # Remove batch dim
+        # embedding_memory[str_label].append(embedding.detach().squeeze(0))  # Remove batch dim
+        embedding_memory[str_label].append(teacher_embedding.detach().squeeze(0))  # Remove batch dim
         print(f'embedding_memory.keys() = {embedding_memory.keys()}')
 
-        # Limit memory size (e.g., store only the last 10 per class)
-        if len(embedding_memory[str_label]) > 5:
+        # Limit memory size (e.g., store only the last 5 per class)
+        if len(embedding_memory[str_label]) > 1:
             embedding_memory[str_label].pop(0)  
 
-        return loss   
+        return loss
+    
+
+def margin_loss(preds, targets, margin_scale=0.5):
+    """
+    preds: (N, 1) predicted scores
+    targets: (N, 1) ground truth scores
+    margin_scale: fraction of GT difference to enforce in preds
+    """
+    N = preds.size(0)
+    diff_gt = torch.abs(targets.unsqueeze(0) - targets.unsqueeze(1))  # [N, N]
+    diff_pred = torch.abs(preds.unsqueeze(0) - preds.unsqueeze(1))    # [N, N]
+
+    # Required margin = scaled GT difference
+    required_margin = margin_scale * diff_gt
+
+    # Loss: only penalize if predicted diff < required margin
+    loss_matrix = F.relu(required_margin - diff_pred)
+
+    # Avoid counting self-pairs
+    mask = ~torch.eye(N, dtype=torch.bool, device=preds.device)
+    loss = loss_matrix[mask].mean()
+    return loss
         
 
 def get_regression_losses():
-    return {'mse':torch.nn.MSELoss(), 'mae':torch.nn.L1Loss(), 'huber':torch.nn.HuberLoss(delta=0.5), 'logcosh':LogCoshLoss(), 'cox':PartialLogLikelihoodLoss(), 'trunc_mse':Truncated_MSE_Loss(), 'weighted_mse': Weighted_MSE_Loss()}
+    return {'mse':torch.nn.MSELoss(), 'mae':torch.nn.L1Loss(), 'huber':torch.nn.HuberLoss(delta=0.5), 'logcosh':LogCoshLoss(), 'cox':PartialLogLikelihoodLoss(), 'trunc_mse':Truncated_MSE_Loss(), 
+            'weighted_mse': Weighted_MSE_Loss(), 'spearmanr': spearmanr, 'pearsonr': pearsonr}
 
 
 def get_loss_function(args):
@@ -524,11 +840,13 @@ def get_loss_function(args):
         loss_fn = torch.nn.BCEWithLogitsLoss()
     elif task_setting == 'multi_class' or task_setting == 'binary':
         loss_fn = torch.nn.CrossEntropyLoss()
+        # loss_fn = PenalizedCELoss(args.n_classes)
     elif task_setting == 'continuous':
         losses = get_regression_losses()
         loss_fn = losses[args.loss_fn]
     else:
         raise NotImplementedError
+    print(f'Using {loss_fn} as the loss function.')
     return loss_fn
 
 
@@ -585,3 +903,88 @@ def log_writer(log_dict: dict, step: int, report_to: str='tensorboard', writer=N
         writer.log(log_dict, step=step)
     else:
         raise NotImplementedError
+
+
+def parse_tile_name(tile_name):
+    # Example format: "33024x_12288y.png"
+    match = re.match(r"(\d+)x_(\d+)y.png", tile_name)
+    if match:
+        x_start, y_start = map(int, match.groups())
+        x_end, y_end = x_start + SLIDE_PATCH_SIZE, y_start + SLIDE_PATCH_SIZE
+        return x_start, x_end, y_start, y_end
+    else:
+        raise ValueError(f"Invalid tile_name format: {tile_name}")
+
+def correct_coords(x_y_coords: np.array):
+    rounded_mpp = round_mpp(SLIDE_MPP)
+    mpp_correction_factor = SLIDE_MPP / rounded_mpp
+    # x_y_coords = tuple(map(lambda x: x * (mpp_correction_factor * DESIRED_MPP) / SLIDE_MPP, x_y_coords))
+    x_y_coords = x_y_coords * (mpp_correction_factor * DESIRED_MPP) / SLIDE_MPP
+    return x_y_coords
+
+def slide_to_thumb_coord(x_y_slide_coords: np.array, slide_dimensions, thumb_size):
+    """
+    Converts a coordinate from the slide to the corresponding coordinate in the thumbnail.
+
+    Parameters:
+    - slide: The OpenSlide object.
+    - thumb: The thumbnail image (PIL Image or similar).
+    - x_y_coords: An np.array (x, y) representing coordinates on the slide.
+
+    Returns:
+    - An np.array (x, y) representing the corresponding coordinates on the thumbnail.
+    """
+    # Get dimensions of the thumbnail
+    thumb_width, thumb_height = thumb_size
+
+    # Get dimensions of the slide
+    slide_width, slide_height = slide_dimensions
+
+    # Calculate scale factors
+    scale_x = thumb_width / slide_width
+    scale_y = thumb_height / slide_height
+
+    # Convert slide coordinates to thumbnail coordinates
+    x_y_slide_coords[:, 0] = (x_y_slide_coords[:, 0] * scale_x).astype(int)
+    x_y_slide_coords[:, 1] = (x_y_slide_coords[:, 1] * scale_y).astype(int)
+
+    return x_y_slide_coords.astype(int)
+
+def thumb_to_slide_coord(x_y_thumb_coords: np.array, slide_dimensions, thumb_size):
+    """
+    Converts a coordinate from the thumbnail to the corresponding coordinate in the slide.
+
+    Parameters:
+    - thumb: The thumbnail image (PIL Image or similar).
+    - slide: The OpenSlide object.
+    - thumb_coord: A tuple (x, y) representing the coordinate on the thumb.
+
+    Returns:
+    - A tuple (x, y) representing the corresponding coordinate on the slide.
+    """
+    # Get dimensions of the thumbnail
+    thumb_width, thumb_height = thumb_size
+
+    # Get dimensions of the slide
+    slide_width, slide_height = slide_dimensions
+
+    # Calculate scale factors
+    scale_x = slide_width / thumb_width
+    scale_y = slide_height / thumb_height
+
+    # Convert thumb coordinates to slide coordinates
+    x_y_thumb_coords[:, 0] = (x_y_thumb_coords[:, 0] * scale_x).astype(int)
+    x_y_thumb_coords[:, 1] = (x_y_thumb_coords[:, 1] * scale_y).astype(int)
+
+    return x_y_thumb_coords.astype(int)
+
+# Function to round mpp values to the nearest 1/(2n) or 1
+def round_mpp(mpp_value):
+    try:
+        if abs(mpp_value - 1) < 0.1:
+            return 1
+        else:
+            n = int(round(1 / (2 * mpp_value)))
+            return 1 / (2 * n)
+    except:
+        return None
