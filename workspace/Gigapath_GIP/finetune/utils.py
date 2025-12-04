@@ -135,28 +135,22 @@ def slide_collate_fn(samples):
     coord_list = [s['coords'] for s in samples]
     ihc_coord_list = [s['ihc_coords'] for s in samples]
     label_list = [s['labels'] for s in samples]
-    teacher_label_list = [s['teacher_labels'] for s in samples]
-    tile_label_list = [s['local_labels'] for s in samples]
     matching_tiles_list = [s['matching_tiles'] for s in samples]
     tumor_indices_list = [s['tumor_indices'] for s in samples]
     non_tumor_indices_list = [s['non_tumor_indices'] for s in samples]
+    cancer_prob_list = [s['cancer_prob'] for s in samples]
     tiles_list = [s['tiles'] for s in samples]
     ihc_tiles_list = [s['ihc_tiles'] for s in samples]
     tile_y_list = [s['tile_y'] for s in samples]
-    tile_x_list = [s['tile_x'] for s in samples]
-    tile_reg_x_list = [s['tile_reg_x'] for s in samples]
     slide_id_list = [s['slide_id'] for s in samples]
     labels = torch.stack(label_list)
-    teacher_labels = torch.stack(teacher_label_list) if teacher_label_list[0] is not None else None # Delete
-    local_labels = torch.stack(tile_label_list) if tile_label_list[0] is not None else None
     matching_tiles = torch.stack(matching_tiles_list) if matching_tiles_list[0] is not None else None
     tumor_indices = torch.stack(tumor_indices_list) if tumor_indices_list[0] is not None else None
     non_tumor_indices = torch.stack(non_tumor_indices_list) if non_tumor_indices_list[0] is not None else None
+    cancer_prob = torch.stack(cancer_prob_list) if cancer_prob_list[0] is not None else None
     tiles = torch.stack(tiles_list) if tiles_list[0] is not None else None
     ihc_tiles = torch.stack(ihc_tiles_list) if ihc_tiles_list[0] is not None else None
     tile_y = torch.stack(tile_y_list) if tile_y_list[0] is not None else None
-    tile_x = torch.stack(tile_x_list) if tile_x_list[0] is not None else None
-    tile_reg_x = torch.stack(tile_reg_x_list) if tile_reg_x_list[0] is not None else None
     censoreship = [s['censoreship'] for s in samples]
     pad_imgs, pad_coords, pad_mask = pad_tensors(image_list, coord_list)
     
@@ -182,16 +176,13 @@ def slide_collate_fn(samples):
             'pad_mask': pad_mask,
             'ihc_pad_mask': ihc_pad_mask,
             'labels': labels,
-            'teacher_labels': teacher_labels,
-            'local_labels': local_labels,
             'matching_tiles': matching_tiles,
             'tumor_indices': tumor_indices,
             'non_tumor_indices': non_tumor_indices,
+            'cancer_prob': cancer_prob,
             'tiles': tiles,
             'ihc_tiles': ihc_tiles,
             'tile_y': tile_y,
-            'tile_x': tile_x,
-            'tile_reg_x': tile_reg_x,
             'censoreship': censoreship}
     return data_dict
 
@@ -498,6 +489,22 @@ class Weighted_MSE_Loss(torch.nn.Module):
         self, y_pred: torch.Tensor, y_true: torch.Tensor, weights: torch.Tensor
     ) -> torch.Tensor:
         return (weights * (y_pred - y_true) ** 2).mean()
+
+
+class Assymmetric_MSE_Loss(torch.nn.Module):
+    def __init__(self, w_over=1.0, w_under=1.0):
+        super().__init__()
+        self.w_over = w_over
+        self.w_under = w_under
+
+    def forward(
+        self, y_pred: torch.Tensor, y_true: torch.Tensor
+    ) -> torch.Tensor:
+        diff = y_pred - y_true
+        loss = torch.where(diff > 0,
+                        self.w_over * diff * diff,   # overestimates
+                        self.w_under * diff * diff)  # underestimates
+        return loss.mean()
 
 
 class PenalizedCELoss(torch.nn.Module):
@@ -826,11 +833,64 @@ def margin_loss(preds, targets, margin_scale=0.5):
     mask = ~torch.eye(N, dtype=torch.bool, device=preds.device)
     loss = loss_matrix[mask].mean()
     return loss
+
+
+def soft_rank(x, regularization_strength=1.0):
+    """
+    NeuralSort-based soft ranking function.
+    x: [batch]
+    Returns approximate ranks with smooth gradients.
+    """
+    x = x.view(-1, 1)
+    n = x.size(0)
+
+    # Pairwise differences
+    diff = x - x.t()  # shape [n, n]
+
+    # Soft permutation matrix with temperature = regularization_strength
+    # P = F.softmax(-diff / regularization_strength, dim=-1)
+    P = F.sigmoid(-diff / regularization_strength)
+
+    # Compute expected rank from permutation matrix
+    # rank = torch.sum(P * torch.arange(n, device=x.device, dtype=torch.float).view(1, -1), dim=-1)
+    rank = n - P.sum(dim=1)
+    return rank
+
+
+class SoftSpearmanLoss(torch.nn.Module):
+    def __init__(self, regularization_strength=1.0, eps=1e-8):
+        """
+        regularization_strength ~ temperature of sorting
+        lower = sharper → better ordering but less smooth gradients
+        """
+        super().__init__()
+        self.reg = regularization_strength
+        self.eps = eps
+
+    def forward(self, y_pred, y_true):
+        y_pred, y_true = y_pred.view(-1), y_true.view(-1)
+        # Soft ranks for prediction
+        y_pred_rank = soft_rank(y_pred, self.reg)
+
+        # Hard ranks for ground truth (no need to be differentiable)
+        y_true_rank = torch.argsort(torch.argsort(y_true)).float()
+        # print(f'y_true_rank = {y_true_rank}')
+
+        # Spearman correlation = Pearson on ranks
+        vx = y_pred_rank - torch.mean(y_pred_rank)
+        vy = y_true_rank - torch.mean(y_true_rank)
+        # print(f'vx = {vx}, vy = {vy}')
+
+        corr = torch.sum(vx * vy) / (
+            torch.sqrt(torch.sum(vx ** 2)) *
+            torch.sqrt(torch.sum(vy ** 2)) + self.eps
+        )
+        return 1 - corr
         
 
 def get_regression_losses():
     return {'mse':torch.nn.MSELoss(), 'mae':torch.nn.L1Loss(), 'huber':torch.nn.HuberLoss(delta=0.5), 'logcosh':LogCoshLoss(), 'cox':PartialLogLikelihoodLoss(), 'trunc_mse':Truncated_MSE_Loss(), 
-            'weighted_mse': Weighted_MSE_Loss(), 'spearmanr': spearmanr, 'pearsonr': pearsonr}
+            'weighted_mse': Weighted_MSE_Loss(), 'a_mse': Assymmetric_MSE_Loss(), 'spearmanr': spearmanr, 'pearsonr': pearsonr}
 
 
 def get_loss_function(args):

@@ -120,45 +120,162 @@ def update_excel_file(file_path: str, save_file: str, output_dirs: list):
     print(f"Updated file '{save_file}' has been created.")
 
 
-def compute_ci_pval(df_baseline, df_local):
-    tile_y = df_baseline['tile_y'].values
-    tile_y_bin = df_baseline['tile_y_bin'].values
-    tile_pred_baseline = df_baseline['tile_pred'].values
-    tile_pred_local = df_local['tile_pred'].values
-    for metric_func in [roc_auc_score, mean_squared_error, spearmanr]:
-        if metric_func in [spearmanr, mean_squared_error]:
-            if metric_func == spearmanr:
-                baseline_metric = metric_func(tile_y, tile_pred_baseline)[0]
-                local_metric = metric_func(tile_y, tile_pred_local)[0]
-            else:
-                baseline_metric = metric_func(tile_y, tile_pred_baseline)
-                local_metric = metric_func(tile_y, tile_pred_local)
-            diff, ci, pval = bootstrap_diff(metric_func, tile_y, tile_pred_baseline, tile_pred_local)
-        else:
-            baseline_metric = metric_func(tile_y_bin, tile_pred_baseline)
-            local_metric = metric_func(tile_y_bin, tile_pred_local)
-            diff, ci, pval = bootstrap_diff(metric_func, tile_y_bin, tile_pred_baseline, tile_pred_local)
-        print(f'Tile-level {metric_func.__name__}: baseline = {baseline_metric:.4f}, local = {local_metric:.4f}, '
-              f'diff = {diff:.4f}, 95% CI = [{ci[0]:.4f}, {ci[1]:.4f}], p-value = {pval:.80f}')
+# def compute_ci_pval(baseline_dfs, local_dfs):
+#     for i in range(len(baseline_dfs)):
+#         df_baseline = baseline_dfs[i]
+#         df_local = local_dfs[i]
+#         tile_y = df_baseline['tile_y'].values
+#         tile_y_bin = df_baseline['tile_y_bin'].values
+#         tile_pred_baseline = df_baseline['tile_pred'].values
+#         tile_pred_local = df_local['tile_pred'].values
+#         for metric_func in [roc_auc_score, mean_squared_error, spearmanr]:
+#             if metric_func in [spearmanr, mean_squared_error]:
+#                 # if metric_func == spearmanr:
+#                 #     baseline_metric = metric_func(tile_y, tile_pred_baseline)[0]
+#                 #     local_metric = metric_func(tile_y, tile_pred_local)[0]
+#                 # else:
+#                     # baseline_metric = metric_func(tile_y, tile_pred_baseline)
+#                     # local_metric = metric_func(tile_y, tile_pred_local)
+#                 diff, diff_ci, baseline_ci, local_ci, pval = bootstrap_diff(metric_func, tile_y, tile_pred_baseline, tile_pred_local)
+#             else:
+#                 # baseline_metric = metric_func(tile_y_bin, tile_pred_baseline)
+#                 # local_metric = metric_func(tile_y_bin, tile_pred_local)
+#                 diff, diff_ci, baseline_ci, local_ci, pval = bootstrap_diff(metric_func, tile_y_bin, tile_pred_baseline, tile_pred_local)
+#             print(f'Tile-level {metric_func.__name__}: baseline CI = [{baseline_ci[0]:.4f}, {baseline_ci[1]:.4f}], local CI = [{local_ci[0]:.4f}, {local_ci[1]:.4f}], '
+#                 f'diff = {diff:.4f}, 95% CI = [{diff_ci[0]:.4f}, {diff_ci[1]:.4f}], p-value = {pval:.4f}')
 
 
-def bootstrap_diff(metric_func, y_true, y_pred1, y_pred2, n_boot=1000):
+# def bootstrap_diff(metric_func, y_true, y_pred1, y_pred2, n_boot=1000):
+#     rng = np.random.default_rng(42)
+#     n = len(y_true)
+#     print(f"n = {n}")
+#     diffs = []
+#     m1s, m2s = [], []
+#     for _ in range(n_boot):
+#         idx = rng.choice(n, size=n, replace=True)
+#         m1 = metric_func(y_true[idx], y_pred1[idx])
+#         m2 = metric_func(y_true[idx], y_pred2[idx])
+#         if metric_func == spearmanr:
+#             m1 = m1[0]
+#             m2 = m2[0]
+#         diffs.append(m2 - m1)  # local - baseline
+#         m1s.append(m1)
+#         m2s.append(m2)
+#     diffs = np.array(diffs)
+#     m1s, m2s = np.array(m1s), np.array(m2s)
+#     diff_ci = np.percentile(diffs, [2.5, 97.5])
+#     m1_ci, m2_ci = np.percentile(m1s, [2.5, 97.5]), np.percentile(m2s, [2.5, 97.5])
+#     pval = (np.sum(diffs <= 0) / n_boot) if np.mean(diffs) > 0 else (np.sum(diffs >= 0) / n_boot)
+#     return np.mean(diffs), diff_ci, m1_ci, m2_ci, pval
+
+def compute_ci_pval(baseline_dfs, local_dfs, pred_tile_y, n_boot=1000):
+    group_dfs_by_patient(baseline_dfs, local_dfs)
+    metrics = [roc_auc_score, mean_squared_error, spearmanr]
+
+    for metric_func in metrics:
+        diff, diff_ci, baseline_ci, local_ci, pval = bootstrap_diff_cv(
+            metric_func, baseline_dfs, local_dfs, pred_tile_y, n_boot=n_boot
+        )
+
+        print(
+            f'Tile-level {metric_func.__name__}: '
+            f'baseline CI = {baseline_ci.mean():.4f} [{baseline_ci[0]:.4f}, {baseline_ci[1]:.4f}], '
+            f'local CI = {local_ci.mean():.4f} [{local_ci[0]:.4f}, {local_ci[1]:.4f}], '
+            f'diff = {diff:.4f}, 95% CI = [{diff_ci[0]:.4f}, {diff_ci[1]:.4f}], '
+            f'p-value = {pval:.4f}'
+        )
+
+def group_dfs_by_patient(baseline_dfs, local_dfs):
+    her2_file_path = './workspace/WSI/metadata_csvs/Her2_slides_matched_HE_folds_HE.csv'
+    read_columns = ['file', 'patient barcode', 'Her2_status']
+    text_cols = ['file', 'slide_name']
+    her2_df_full = pd.read_csv(her2_file_path)
+    her2_df = her2_df_full[read_columns]
+    her2_df['slide_name'] = her2_df['file'].apply(lambda x: x.split('.')[0])
+    for i in range(len(baseline_dfs)):
+        df_b = baseline_dfs[i]
+        df_l = local_dfs[i]
+        df_b = df_b.merge(her2_df, left_on='slide_name', right_on='slide_name', how='left').drop(columns=text_cols)
+        df_l = df_l.merge(her2_df, left_on='slide_name', right_on='slide_name', how='left').drop(columns=text_cols)
+        per_pat_b_df = df_b.groupby('patient barcode').mean()
+        per_pat_l_df = df_l.groupby('patient barcode').mean()
+        per_pat_b_df['Her2_status'] = (per_pat_b_df['Her2_status'] >= 0.5).astype(int)
+        per_pat_l_df['Her2_status'] = (per_pat_l_df['Her2_status'] >= 0.5).astype(int)
+        df_b = per_pat_b_df.reset_index()
+        df_l = per_pat_l_df.reset_index()
+        baseline_dfs[i] = df_b
+        local_dfs[i] = df_l
+    
+
+def bootstrap_diff_cv(metric_func, baseline_dfs, local_dfs, pred_tile_y, n_boot=1000):
     rng = np.random.default_rng(42)
-    n = len(y_true)
-    print(f"n = {n}")
-    diffs = []
+    K = len(baseline_dfs)
+
+    # Bootstrap within-fold
+    boot_baseline = []
+    boot_local = []
+    boot_diff = []
+
+    if pred_tile_y:
+        gt_col = 'tile_y'
+        gt_bin_col = 'tile_y_bin'
+        pred_col = 'tile_pred'
+    else:
+        gt_col = 'label'
+        gt_bin_col = 'Her2_status'
+        pred_col = 'score'
+
     for _ in range(n_boot):
-        idx = rng.choice(n, size=n, replace=True)
-        m1 = metric_func(y_true[idx], y_pred1[idx])
-        m2 = metric_func(y_true[idx], y_pred2[idx])
-        if metric_func == spearmanr:
-            m1 = m1[0]
-            m2 = m2[0]
-        diffs.append(m2 - m1)  # local - baseline
-    diffs = np.array(diffs)
-    ci = np.percentile(diffs, [2.5, 97.5])
-    pval = (np.sum(diffs <= 0) / n_boot) if np.mean(diffs) > 0 else (np.sum(diffs >= 0) / n_boot)
-    return np.mean(diffs), ci, pval
+        fold_bs_baseline = []
+        fold_bs_local = []
+
+        # bootstrap each fold independently
+        for i in range(K):
+            df_b = baseline_dfs[i]
+            df_l = local_dfs[i]
+            
+            gt = df_b[gt_col].values
+            gt_bin = df_b[gt_bin_col].values
+            pred_b = df_b[pred_col].values
+            pred_l = df_l[pred_col].values
+
+            n_i = len(gt)
+            idx = rng.choice(n_i, size=n_i, replace=True)
+
+            if metric_func == roc_auc_score:
+                m_b = metric_func(gt_bin[idx], pred_b[idx])
+                m_l = metric_func(gt_bin[idx], pred_l[idx])
+            else:
+                m_b = metric_func(gt[idx], pred_b[idx])
+                m_l = metric_func(gt[idx], pred_l[idx])
+                if metric_func == spearmanr:
+                    m_b = m_b[0]
+                    m_l = m_l[0]
+
+            fold_bs_baseline.append(m_b)
+            fold_bs_local.append(m_l)
+
+        # Average metrics across folds for this bootstrap sample
+        boot_baseline.append(np.mean(fold_bs_baseline))
+        boot_local.append(np.mean(fold_bs_local))
+        boot_diff.append(np.mean(fold_bs_local) - np.mean(fold_bs_baseline))
+
+    boot_baseline = np.array(boot_baseline)
+    boot_local = np.array(boot_local)
+    boot_diff = np.array(boot_diff)
+
+    # Confidence intervals
+    baseline_ci = np.percentile(boot_baseline, [2.5, 97.5])
+    local_ci = np.percentile(boot_local, [2.5, 97.5])
+    diff_ci = np.percentile(boot_diff, [2.5, 97.5])
+
+    # p-value based on sign of difference
+    if np.mean(boot_diff) > 0:
+        pval = np.mean(boot_diff <= 0)
+    else:
+        pval = np.mean(boot_diff >= 0)
+
+    return np.mean(boot_diff), diff_ci, baseline_ci, local_ci, pval
 
 
 def compute_metrics(her2_file_path, score_cols, label_col, plot_labels, folds=[], save_dir=None):
@@ -359,6 +476,7 @@ def main():
     parser.add_argument('-tsd', '--tile_score_dir', type=str, default=None, help='Dir from which to take tile scores')
     parser.add_argument('-ce', '--comp_embeds', action='store_true', default=False, help='Use compressed tile embeddings')
     parser.add_argument('-ccp', '--compute_ci_pval', action='store_true', default=False, help='Compute 95% CI and p-val for tile predictions')
+    parser.add_argument('-pty', '--pred_tile_y', action='store_true', default=False, help='Use predicted tile y for computing CI and p-val')
 
     # example command: -f ./excel_files/Her2_slides_matched_HE_folds_infer.csv -sf ./excel_files/carmel_per_block_marked.xlsx -fr IHC_to_Her2_score IHC_to_Her2_status HE_to_Her2_score HE_to_Her2_status -p
     args = parser.parse_args()
@@ -398,17 +516,19 @@ def main():
             baseline_dfs = []
             local_dfs = []
             for i in range(1, 6):
+                if args.pred_tile_y:
+                    preds_dir = f"her2/{args.output_dirs[-1]}_infer_tumor_tile{i}/eval_pretrained_her2/inference_results/"
+                    preds_file = f'tile_y_preds_mpp2_val{i}.csv'
+                else:
+                    preds_dir = f"her2/{args.output_dirs[-1]}_infer{i}/eval_pretrained_her2/inference_results/"
+                    preds_file = 'slide_scores.csv'
                 y_pred1_path = os.path.join(os.getcwd(), 'outputs/mpp2', args.output_dirs[0], 
-                                            f"her2/{args.output_dirs[0]}_infer{i}/eval_pretrained_her2/inference_results/", 
-                                            f'tile_y_preds_mpp2_val{i}.csv')
-                y_pred2_path = os.path.join(os.getcwd(), 'outputs/mpp2', args.output_dirs[1],
-                                            f"her2/{args.output_dirs[-1]}_infer_tumor_tile{i}/eval_pretrained_her2/inference_results/", 
-                                            f'tile_y_preds_mpp2_val{i}.csv')
+                                            f"her2/{args.output_dirs[0]}_infer{i}/eval_pretrained_her2/inference_results/", preds_file)
+                y_pred2_path = os.path.join(os.getcwd(), 'outputs/mpp2', args.output_dirs[1], preds_dir, preds_file)
                 baseline_dfs.append(pd.read_csv(y_pred1_path))
                 local_dfs.append(pd.read_csv(y_pred2_path))
-            df_baseline = pd.concat(baseline_dfs, ignore_index=True)
-            df_local = pd.concat(local_dfs, ignore_index=True)
-            compute_ci_pval(df_baseline=df_baseline, df_local=df_local)
+
+            compute_ci_pval(baseline_dfs=baseline_dfs, local_dfs=local_dfs, pred_tile_y=args.pred_tile_y)
         else:
             print(f'Please provide exactly two output dirs to compute 95% CI and p-val.\n'
                 f'output_dirs = {args.output_dirs}')

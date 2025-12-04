@@ -215,9 +215,9 @@ def read_slide_file(excel_path: str, args):
     if args.cancer_annotations:
         slides_df = load_file_polygons(slides_df)
 
-    if args.registration_annotated:
-        batches = ['Batch_1', 'Batch_2']
+    if not args.all_data:
         slide_path_key = 'Path'
+        batches = ['Batch_1', 'Batch_2']
         slides_df = slides_df[slides_df[slide_path_key].str.contains('|'.join(batches), na=False)]
     
     return slides_df
@@ -273,7 +273,7 @@ def segment_from_model_or_annotations(args, row, slide_file, segment_dir, st):
 def save_tumor_indices_and_cancer_probs(args, full_ti_dir, ti, nti, cp, segment_dir, slide_name, valid_tiles, valid_indices, tile_segment):
     tumor_indices = []
     non_tumor_indices = []
-    if args.seg_from_cancer_predictions:
+    if args.seg_from_my_cancer_predictions:
         if os.path.exists(cp):
             cancer_prob = np.load(cp)
             cancer_prob = cancer_prob[valid_indices]  # Filter to valid tiles
@@ -300,16 +300,16 @@ def save_tumor_indices_and_cancer_probs(args, full_ti_dir, ti, nti, cp, segment_
             if tile_segment[he_thumb_window_center[0][0], he_thumb_window_center[0][1]] == 3:
                 non_tumor_indices.append(idx)
 
-        if args.seg_from_cancer_predictions:
+        if args.seg_from_my_cancer_predictions:
             tile_pred_segment[he_thumb_window_center[0][0], he_thumb_window_center[0][1]] = cancer_prob[idx]
             if cancer_prob[idx] >= 0.5:
                 tumor_indices.append(idx)
             
     
-    if args.seg_from_cancer_predictions:
+    if args.seg_from_my_cancer_predictions:
         save_segmented_tiles(segment_map=tile_pred_segment, segment_dir=segment_dir, save_name=f'Binary Cancer Probability (MPP=2 GigaPath features trained model) val_fold = {args.val_fold}')
 
-    if args.save_tumor_indices_from_seg_map or args.seg_from_cancer_predictions:
+    if args.save_tumor_indices_from_seg_map or args.seg_from_my_cancer_predictions:
         if len(tumor_indices) == 0:
             print(f"No tumor tiles found for slide {slide_name}.")
             # return None
@@ -337,9 +337,10 @@ def main():
     parser.add_argument('-seg', '--segment_tiles', action='store_true', default=False, help='Segment image tiles')
     parser.add_argument('-y_std', '--y_std', action='store_true', default=False, help='Calculate standard deviation of tile_y')
     parser.add_argument('-reg_an', '--registration_annotated', action='store_true', default=False, help='filter annotated slides for registration')
+    parser.add_argument('-ad', '--all_data', action='store_true', default=False, help='Use all the data (annotated)')
     parser.add_argument('-cancer_an', '--cancer_annotations', action='store_true', default=False, help='process annotated slides for cancer classification')
     parser.add_argument('-save_tifsm', '--save_tumor_indices_from_seg_map', action='store_true', default=False, help='save tumor tile indices from segmentation map')
-    parser.add_argument('-seg_from_cp', '--seg_from_cancer_predictions', action='store_true', default=False, help='save tile cancer prediction map')
+    parser.add_argument('-seg_from_cp', '--seg_from_my_cancer_predictions', action='store_true', default=False, help='save tile cancer prediction map')
     parser.add_argument('-vf', '--val_fold', type=str, help='validation fold used for cancer model', default='', choices=['1', '2', '3', '4', '5'])
 
     args = parser.parse_args()
@@ -411,7 +412,7 @@ def main():
         if not args.cancer_annotations:
             matching_tiles = np.load(os.path.join(full_mt_dir, 'ihc_tiles.npy'))
             valid_tiles = [tile for idx, tile in enumerate(tiles) if not np.isnan(matching_tiles[idx])]
-            valid_indices = [idx for idx, tile in enumerate(tiles) if not np.isnan(matching_tiles[idx])]
+            valid_indices = [idx for idx, _ in enumerate(tiles) if not np.isnan(matching_tiles[idx])]
         else:
             valid_tiles = tiles
             valid_indices = list(range(len(tiles)))
@@ -427,7 +428,7 @@ def main():
                 print(f"Tile segmentation map not found for slide {slide_name}. Skipping...")
                 continue
             
-        if args.save_tumor_indices_from_seg_map or args.seg_from_cancer_predictions:
+        if args.save_tumor_indices_from_seg_map or args.seg_from_my_cancer_predictions:
             tumor_indices = save_tumor_indices_and_cancer_probs(args, full_ti_dir, ti, nti, cp, segment_dir, slide_name, valid_tiles, valid_indices, tile_segment)
         else:
             tumor_indices = np.load(ti) if os.path.exists(ti) else None

@@ -907,6 +907,31 @@ def init_dist_dict(dict_json_path: str):
 
     return dist_dict
 
+def parse_thumb_names(png_images: list):
+    # extract the 4-digit prefix (after removing optional "copy_")
+    def get_prefix(name):
+        clean = name.replace("copy_", "")
+        return clean.split("_")[0]
+
+    groups = {}
+    for f in png_images:
+        prefix = get_prefix(f)
+        if prefix not in groups:
+            groups[prefix] = []
+        groups[prefix].append(f)
+
+    # find the prefix that occurs twice and the one that occurs once
+    ihc_prefix = [p for p, items in groups.items() if len(items) == 2][0]
+    he_prefix = [p for p, items in groups.items() if len(items) == 1][0]
+
+    ihc_thumbs = groups[ihc_prefix]
+    copy_index = 0 if "copy_" in ihc_thumbs[0] else 1
+    thumb_Her2_copy = ihc_thumbs[copy_index]
+    thumb_Her2 = ihc_thumbs[1 - copy_index]
+    thumb_HE = groups[he_prefix][0]
+
+    return thumb_HE, thumb_Her2, thumb_Her2_copy
+
 
 def main():
     # Argument parser
@@ -935,10 +960,10 @@ def main():
         for ind, dir in enumerate(os.listdir(marked_folder_path)):
             print(f'dir = {dir}')
             # if dir in tri_dist:
-            if dir in rigid_dist and dir != '21-6755_1_1':  #
+            if dir in rigid_dist and dir != '19-9595_1_1':  #
                 print(f'Directory already done')
                 continue
-            if dir != '21-6755_1_1':
+            if dir != '19-9595_1_1':
                 continue
 
             # Initialize paths
@@ -948,18 +973,13 @@ def main():
                 continue
 
             png_images = list(filter(lambda x: x.endswith('.png') and not x.startswith('map') and not x.startswith('Transformed'), os.listdir(folder)))
-            if len(png_images) < 2:
+            if len(png_images) < 3:
                 # tri_dist[dir] = 'Directory does not contain enough images'
                 rigid_dist[dir] = 'Directory does not contain enough images'
                 print('Directory does not contain enough images')
                 continue
 
-            # order the thumbs by the last letter in their name
-            ordered_thumbs = sorted(png_images, key=lambda x: x.split('_')[-1][0])
-            if len(ordered_thumbs) == 3:
-                thumb_HE, thumb_Her2, thumb_Her2_copy = ordered_thumbs[0], ordered_thumbs[1], ordered_thumbs[2]
-            else:
-                thumb_HE, thumb_Her2, thumb_Her2_copy = ordered_thumbs[0], ordered_thumbs[1], ordered_thumbs[1]
+            thumb_HE, thumb_Her2, thumb_Her2_copy = parse_thumb_names(png_images=png_images)
 
             im_HE, im_Her2, im_Her2_copy, output_mapping_file = load_and_display_thumbs(folder_path=folder,
                                                                                         HE_thumb_name=thumb_HE,
@@ -969,6 +989,7 @@ def main():
 
             im_Her2 = rotate_back_annotation_img(im_Her2=im_Her2, im_Her2_copy=im_Her2_copy, display=False)
             if type(im_Her2) is int:
+                rigid_dist[dir] = 'Could not rotate Her2 image back to original orientation'
                 continue
 
             # Find landmarks in H&E thumb

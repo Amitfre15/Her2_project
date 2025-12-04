@@ -204,7 +204,7 @@ def main():
     # Paths
     # base_path = "/SSDStorage/Breast/Carmel/Her2/Batch_2/HER2_2/"
     # excel_path = os.path.join(base_path, "slides_data_HER2_2.xlsx")
-    # base_path = "/data/Breast/Carmel/9-11/Batch_11/CARMEL11/"
+    base_path = "/data/Breast/Carmel/9-11/Batch_11/CARMEL11/"
     base_path = args.base_path
     # excel_path = os.path.join(base_path, "slides_data_CARMEL9.xlsx")
     # excel_path = "/home/amitf/workspace/WSI/metadata_csvs/Her2_slides_matched_HE_folds_HE.csv"

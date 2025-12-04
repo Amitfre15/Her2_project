@@ -58,6 +58,9 @@ def get_finetune_params():
     parser.add_argument('--cat_x',          action='store_true', default=False, help='Concatenate IHC compressed features (from IHC2) to H&E tile features')
     parser.add_argument('--trim_images',    action='store_true', default=False, help='Concatenate IHC compressed features (from IHC2) to trimmed H&E tile features')
     parser.add_argument('--x_as_sb',        action='store_true', default=False, help='Use IHC compressed features (from IHC2) as modulation (scale and bias) for H&E tile features')
+    parser.add_argument('--score_can_as_sb',action='store_true', default=False, help='Use tile scores and cancer probs as modulation (scale and bias) for H&E tile features')
+    parser.add_argument('--score_can_as_bs',action='store_true', default=False, help='Use tile scores and cancer probs as modulation (bias and scale) for H&E tile features')
+    parser.add_argument('--film',           action='store_true', default=False, help='Use tile scores and cancer probs as modulation (bias and scale) for H&E tile features via FiLM layer')
     parser.add_argument('--cat_reg_x',      action='store_true', default=False, help='Concatenate regressed IHC compressed features from H&E tile features')
     parser.add_argument('--create_y',       action='store_true', default=False, help='Create IHC tile score (from IHC0)')
     parser.add_argument('--create_pred_y',  action='store_true', default=False, help='Create HE tile score (from Baseline0)')
@@ -69,9 +72,11 @@ def get_finetune_params():
     parser.add_argument('--predict_cancer', action='store_true', default=False, help='Predict tumor/non tumor per tile')
     parser.add_argument('--only_annotated_tiles',action='store_true', default=False, help='Predict only on tumor/non-tumor annotated tiles')
     parser.add_argument('--only_annotated', action='store_true', default=False, help='Use only annotated pairs of slides')
+    parser.add_argument('--conf_score',     action='store_true', default=False, help='Predict tile scores along with confidence scores')
     parser.add_argument('--global_pool',    action='store_true', default=False, help='Use global pooling, will use [CLS] token if False')
     parser.add_argument('--model_ckpt',     type=str, default='', help='Model checkpoint path')
-    parser.add_argument('--teacher_model_ckpt',     type=str, default='', help='Teacher model checkpoint path')
+    parser.add_argument('--teacher_model_ckpt',type=str, default='', help='Teacher model checkpoint path')
+    parser.add_argument('--tile_model_ckpt',type=str, default='', help='Tile model checkpoint path')
 
     # training settings
     parser.add_argument('--seed',           type=int, default=0, help='Random seed')
@@ -94,7 +99,7 @@ def get_finetune_params():
     parser.add_argument('--save_dir',       type=str, default='', help='Save directory')
     parser.add_argument('--num_workers',    type=int, default=20, help='Number of workers')
     parser.add_argument('--report_to',      type=str, default='tensorboard', help='Logger used for recording', choices=['wandb', 'tensorboard'])
-    parser.add_argument('--loss_fn',        type=str, default='mse', help='Which loss to use in continuous setting', choices=['mse', 'mae', 'huber', 'logcosh', 'cox', 'trunc_mse', 'weighted_mse', 'coral'])
+    parser.add_argument('--loss_fn',        type=str, default='mse', help='Which loss to use in continuous setting', choices=['mse', 'mae', 'huber', 'logcosh', 'cox', 'trunc_mse', 'weighted_mse', 'coral', 'a_mse'])
     parser.add_argument('--fp16',           action='store_true', default=True, help='Fp16 training')
     parser.add_argument('--weighted_sample',action='store_true', default=False, help='Weighted sampling')
     parser.add_argument('--survival'       ,action='store_true', default=False, help='Predict survival, it will load censoreship data')
@@ -106,5 +111,7 @@ def get_finetune_params():
     parser.add_argument('--cl_HE_feat',     action='store_true', default=False, help='Contrastive learning on compressed HE features')
     parser.add_argument('--pred_mean_std',  action='store_true', default=False, help='Apply AdaIN on HE features')
     parser.add_argument('--save_plots',     action='store_true', default=False, help='Save labels and predictions plots')
+    parser.add_argument('--keep_logits_labels',    action='store_true', default=False, help='Keep logits and labels for processing during runtime')
+    
 
     return parser.parse_args()
