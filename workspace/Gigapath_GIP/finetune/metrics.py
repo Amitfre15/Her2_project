@@ -81,10 +81,13 @@ def calculate_multilabel_metrics(probs: np.array, labels: np.array, label_dict, 
 
 
 def calculate_multiclass_or_binary_metrics(probs: np.array, labels: np.array, label_dict, add_metrics: list=None) -> dict:
+    print(f'labels = {labels}, probs = {probs}')
+    print(f'labels.shape = {labels.shape}, probs.shape = {probs.shape}')
     metrics = ['bacc', 'acc', 'auroc', 'auprc'] + (add_metrics if add_metrics is not None else [])
     results = {}
     for average in ['macro', None]: 
         for metric in metrics: 
+            print(f'metric = {metric}')
             metric_func = MakeMetrics(metric=metric, average=average, label_dict=label_dict)
             results.update(metric_func(labels, probs))
     return results
@@ -105,15 +108,15 @@ def calculate_metrics_with_task_cfg(probs: np.array, labels: np.array, task_cfg:
 if __name__ == '__main__':
     label_dict = {'A': 0, 'B': 1, 'C': 2}
     probs = np.array([
-        [0.7, 0.2, 0.1],
-        [0.4, 0.3, 0.3],
-        [0.1, 0.8, 0.1],
-        [0.2, 0.3, 0.5],
-        [0.4, 0.4, 0.2],
-        [0.1, 0.2, 0.7]])
+        [0.7, 0.2],
+        [0.4, 0.3],
+        [0.1, 0.8],
+        [0.2, 0.3],
+        [0.4, 0.4],
+        [0.1, 0.2]])
 
     # make labels into one-hot
-    labels = np.array([0, 1, 1, 1, 0, 0])
+    labels = np.array([[0, 1], [1, 0], [0, 1], [1, 0], [1, 0], [1, 0]])
     # labels = np.eye(3)[labels]
     print(calculate_multiclass_or_binary_metrics(probs, labels, label_dict))
 

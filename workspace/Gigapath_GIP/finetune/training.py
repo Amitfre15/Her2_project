@@ -20,16 +20,20 @@ import torchvision
 from torchvision.utils import save_image
 from tqdm import tqdm
 
-from gigapath.classification_head import get_model, get_regressor, TileClassificationHead
+from gigapath.classification_head import get_model, TileClassificationHead
 from metrics import calculate_metrics_with_task_cfg
 from utils import (get_optimizer, get_loss_function, \
                    Monitor_Score, get_records_array,
                    log_writer, adjust_learning_rate,
                    get_regression_losses, LogCoshLoss, get_test_loader, 
                    Contrastive_Loss, DifferentiableHistogramKL, CLIPLoss, MidPenalizedLoss, margin_loss, Assymmetric_MSE_Loss, SoftSpearmanLoss)
-from slides_to_thumbs import patch_weighted_score_matrices, show_score_matrix, IHC_THUMB_WIDTH, IHC_THUMB_HEIGHT, SEG_THUMB_WIDTH, SEG_THUMB_HEIGHT
+from slides_to_thumbs import patch_weighted_score_matrices, show_score_matrix, SLIDE_HEIGHT, SLIDE_WIDTH, SLIDE_MPP, SLIDE_PATCH_SIZE
 from datasets.slide_datatset import SlidingWindowDataset
 from finetune.cycle_gan import ResNetGenerator, PatchDiscriminator, style_loss
+
+VIRCHOW2_FEATURE_DIM = 2560
+UNI2_FEATURE_DIM = 1536
+CONCH_FEATURE_DIM = 512
 
 def print_free_gpu_memory(device):
     allocated = torch.cuda.memory_allocated(device) / 1024**2
@@ -39,11 +43,18 @@ def print_free_gpu_memory(device):
 def slice_tiles(indices, batch):
     batch['imgs'] = batch['imgs'][:, indices, :]
     batch['coords'] = batch['coords'][:, indices, :]
-    if batch['ihc_imgs'] is not None:
-        batch['ihc_imgs'] = batch['ihc_imgs'][:, indices, :]
-        batch['ihc_coords'] = batch['ihc_coords'][:, indices, :]
+    # if batch['ihc_imgs'] is not None:
+    #     batch['ihc_imgs'] = batch['ihc_imgs'][:, indices, :]
+    #     batch['ihc_coords'] = batch['ihc_coords'][:, indices, :]
     if batch['matching_tiles'] is not None:
-        batch['matching_tiles'] = batch['matching_tiles'][:, indices, :]
+        batch['matching_tiles'] = batch['matching_tiles'][:, indices]
+    if batch['tile_logits'] is not None:
+        batch['tile_logits'] = batch['tile_logits'][:, indices, :]
+    if batch['cancer_prob'] is not None:
+        batch['cancer_prob'] = batch['cancer_prob'][:, indices]
+    if batch['tile_y'] is not None:
+        print(f"Before slicing, batch['tile_y'].shape = {batch['tile_y'].shape}")
+        batch['tile_y'] = batch['tile_y'][:, indices]    
 
 def run_window_inference(data_df, dataset_class, args):
     data_df = data_df[data_df['id'].isin(args.test_dataset)]
@@ -73,24 +84,52 @@ def run_window_inference(data_df, dataset_class, args):
     model.load_state_dict(torch.load(args.model_ckpt), strict=False)
     model.eval()
     results_df = pd.DataFrame({'window_name': [], 'score': [], 'label': []})
+
+    seg_thumb_height = int(SLIDE_HEIGHT * SLIDE_MPP // (SLIDE_PATCH_SIZE * args.target_mpp))
+    seg_thumb_width = int(SLIDE_WIDTH * SLIDE_MPP // (SLIDE_PATCH_SIZE * args.target_mpp))
     for slide in data_df[args.slide_key]:
-        if not slide.startswith("21-1617_2_8"):
-            continue
+        # if not slide.startswith("18-7057_2_1"):
+        #     continue
         args.get_single_slide = slide
         print(f'slide = {slide}.mrxs')
+
+        val_fold_value = args.val_fold[0] if isinstance(args.val_fold, list) else args.val_fold
+        if args.create_y_map:
+            npy_output_path = os.path.join(args.root_path.replace("gigapath_features", "y_map"))
+            if args.pred_y_baseline or args.window_training:
+                npy_output_path = npy_output_path.replace("HE", "IHC")
+            block = slide.rsplit("_", 1)[0] + "_"
+            try:
+                matching_folder = next(filter(lambda x: block in x, os.listdir(npy_output_path)))
+                npy_output_path = os.path.join(npy_output_path, matching_folder)
+            except StopIteration:
+                print(f"Making folder for block {block} in {npy_output_path}")
+                npy_output_path = os.path.join(npy_output_path, block)
+                os.makedirs(npy_output_path, exist_ok=True)
+                
+            npy_file = os.path.join(npy_output_path, f"Tile HER2 contribution (y) from SW (MPP={args.target_mpp} GigaPath features trained model) val_fold = {val_fold_value}.npy")
+            if args.pred_y_baseline:
+                npy_file = npy_file.replace("(y) from SW", "(y) from SW pred SW baseline")
+            elif args.window_training:
+                npy_file = npy_file.replace("(y) from SW", "(y) from SW pred SW training baseline")
+        elif args.create_cancer_map:
+            npy_output_path = os.path.join(args.root_path.replace("gigapath_features", "cancer_map"), slide)
+            npy_file = os.path.join(npy_output_path, f"Tile cancer probability from SW (MPP={args.target_mpp} GigaPath features trained model) val_fold = {val_fold_value}.npy")
+        elif args.create_HER2_status_map:
+            npy_output_path = os.path.join(args.root_path.replace("gigapath_features", "HER2_status_map"), slide)
+            npy_file = os.path.join(npy_output_path, f"Tile HER2 status from SW (MPP={args.target_mpp} GigaPath features trained on THUFA model).npy")
+
         test_data = dataset_class(data_df, args.root_path, args.task_config, slide_key=args.slide_key, label=args.label, \
                                   dataset_name=args.test_dataset, folds=args.test_fold,
                                   use_clinical_features=args.clinical_features, \
                                   test_on_all=args.test_on_all, get_single_slide=args.get_single_slide,
-                                  window_size=args.window_size, stride=args.stride)
+                                  window_size=args.window_size, stride=args.stride, val_fold=args.val_fold)
         test_loader = get_test_loader(test_data, for_heatmap=True, **vars(args))
 
         # Initialize score and weight matrices
-        # weighted_score_matrix = torch.zeros((IHC_THUMB_HEIGHT, IHC_THUMB_WIDTH), dtype=torch.float64).to(args.device)
-        # weight_matrix = torch.zeros((IHC_THUMB_HEIGHT, IHC_THUMB_WIDTH), dtype=torch.float64).to(args.device)
-        # init both matrices with full matrix of minus 1
-        weighted_score_matrix = torch.zeros((SEG_THUMB_HEIGHT, SEG_THUMB_WIDTH), dtype=torch.float64).to(args.device)
-        weight_matrix = torch.zeros((SEG_THUMB_HEIGHT, SEG_THUMB_WIDTH), dtype=torch.float64).to(args.device)
+        print(f'seg_thumb_height = {seg_thumb_height}, seg_thumb_width = {seg_thumb_width}')
+        weighted_score_matrix = torch.zeros(size=(seg_thumb_height, seg_thumb_width), dtype=torch.float64).to(args.device)
+        weight_matrix = torch.zeros(size=(seg_thumb_height, seg_thumb_width), dtype=torch.float64).to(args.device)
 
         with torch.no_grad():
             for batch_idx, batch in enumerate(test_loader):
@@ -115,14 +154,14 @@ def run_window_inference(data_df, dataset_class, args):
                     else:
                         if not args.survival:
                             # un-normalize
-                            score = logits * model.std.item() + model.mean.item()
+                            score = logits # * model.std.item() + model.mean.item()
                             results = {'window_name': window_name, 'score': score.item(),
                                        'label': test_data.label.item()}
 
                     results_df = pd.concat([results_df, pd.DataFrame([results])], ignore_index=True)
 
-                patch_weighted_score_matrices(weighted_score_matrix=weighted_score_matrix, weight_matrix=weight_matrix,
-                                              img_coords=img_coords, window_score=score)
+                patch_weighted_score_matrices(weighted_score_matrix=weighted_score_matrix, weight_matrix=weight_matrix, img_coords=img_coords,
+                                              window_score=score, target_mpp=args.target_mpp, seg_thumb_width=seg_thumb_width)
 
         # Normalize the weighted score matrix by the weight matrix
         final_score_matrix = np.divide(
@@ -136,11 +175,14 @@ def run_window_inference(data_df, dataset_class, args):
 
         # Save the score matrix as a .npz file (NumPy compressed format)
         compressed_score_matrix = final_score_matrix.astype(np.float16)
-        npy_output_path = os.path.join(args.save_dir, f"score_matrix.npy")
-        np.save(npy_output_path, compressed_score_matrix)
-        print(f"Saved score matrix for slide: {slide} at {npy_output_path}")
+        if not os.path.exists(npy_output_path):
+            os.makedirs(npy_output_path, exist_ok=True)
 
-        show_score_matrix(final_score_matrix, slide, save_dir=args.save_dir, vmin=-1, vmax=final_score_matrix.max())
+        np.save(npy_file, compressed_score_matrix)
+        print(f"Saved score matrix for slide: {slide} at {npy_file}")
+
+        vmax = 3 if args.create_y_map else 1
+        show_score_matrix(final_score_matrix, slide, save_dir=npy_file, vmin=-1, vmax=vmax)
 
         # npz_output_path = os.path.join(args.save_dir, f"{slide}_score_matrix.npz")
         # np.savez_compressed(npz_output_path, compressed_score_matrix)
@@ -297,9 +339,16 @@ def test(test_loader, args):
         writer = wandb
     elif "tensorboard" in args.report_to:
         writer = tensorboard.SummaryWriter(writer_dir, flush_secs=15)
-        
+    
+    if args.add_virchow2_features:
+        args.tile_input_dim += VIRCHOW2_FEATURE_DIM
+    if args.add_uni2_features:
+        args.tile_input_dim += UNI2_FEATURE_DIM
+    if args.add_conch_features:
+        args.tile_input_dim += CONCH_FEATURE_DIM
+
     # set up the model
-    if args.score_can_as_sb or args.score_can_as_bs or args.film:  # Delete
+    if (args.score_can_as_sb or args.score_can_as_bs or args.film) and not args.load_tile_logits and not args.tile_slide_model:  # Delete
         args.tile_model, model = get_model(**vars(args))
         args.tile_model = args.tile_model.to(args.device)
         args.tile_model.load_state_dict(torch.load(args.tile_model_ckpt), strict=False)
@@ -324,7 +373,7 @@ def test(test_loader, args):
     # test the model
     test_records, embeds = evaluate(test_loader, model, fp16_scaler, loss_fn, 0, args, save_embed=True) # 'test'
     results_df = pd.DataFrame({'slide_name': [], 'score': [], 'label': []})
-    # save each embedding asa seperate filewith the name being the slide_id
+    # save each embedding as a seperate filewith the name being the slide_id
     for idx, slide_id in enumerate(test_loader.dataset.slide_data[args.slide_key]):
         np.save(os.path.join(args.save_dir, f"{slide_id}.npy"), embeds[idx]) 
         if not args.task_config.get('setting', 'multi_class') == 'continuous':
@@ -484,6 +533,88 @@ def train_cycleGAN(dataloader, fold, args):
         torch.save(G_IHC_HE.state_dict(), f"{args.save_dir}/G_IHC_HE_{epoch}.pth")
 
 
+def train_clinic_reg(dataloader, args):
+    train_loader, val_loader, test_loader = dataloader
+
+    model = get_model(**vars(args))
+    model = model.to(args.device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-3)
+    loss_fn = get_loss_function(args)
+    val_losses = []
+    min_val_loss = float('inf')
+
+    for epoch in range(args.epochs):
+        for batch_idx, batch in enumerate(tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs}")):
+            clinical_feats, score, label, slide_id = batch['clinical_feats'], batch['score'], batch['labels'], batch['slide_id'][-1]
+            print(f'batch_idx = {batch_idx}, slide_id = {slide_id}, label = {label}')            
+
+            clinical_feats = clinical_feats.to(args.device)
+            score = score.to(args.device)
+            label = label.to(args.device).flatten()
+            logits = model(slide_score=score, clinical_features=clinical_feats.flatten()).view(-1, args.n_classes)
+
+            loss = loss_fn(logits, label)
+            print(f"loss = {loss.item()}")
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+        
+        val_loss = test_clinic_reg(val_loader, model, epoch, args)
+        val_losses.append(val_loss)
+
+        # Save models
+        torch.save(model.state_dict(), f"{args.save_dir}/model_epoch_{epoch}_checkpoint.pth")
+
+        if val_loss < min_val_loss:
+            min_val_loss = val_loss
+            torch.save(model.state_dict(), f"{args.save_dir}/checkpoint.pth")
+        
+        # stop after 5 epochs with no improvement
+        if len(val_losses) > 5 and val_losses[-1] > max(val_losses[-6:-1]):
+            print("Early stopping due to no improvement in validation loss")
+            break
+
+def test_clinic_reg(test_loader, model=None, epoch=0, args=None):
+    if args.run_inference:
+        model = get_model(**vars(args))
+        model = model.to(args.device)
+        model.load_state_dict(torch.load(args.model_ckpt), strict=False)
+    model.eval()
+
+    loss_fn = get_loss_function(args)
+
+    test_records = None
+    test_loader.dataset.update_clinical_features_params_and_handle_data(model)
+    results_df = pd.DataFrame({'slide_name': [], 'score': [], 'label': []})
+    losses = []
+    
+    with torch.no_grad():
+        for batch_idx, batch in enumerate(test_loader):
+            slide_id = batch['slide_id'][-1]
+            score = batch['score'].to(args.device)
+            label = batch['labels'].to(args.device).flatten()
+            clinical_feats = batch['clinical_feats'].to(args.device)
+            logits = model(slide_score=score, clinical_features=clinical_feats.flatten()).view(-1, args.n_classes)
+            loss = loss_fn(logits, label)
+            losses.append(loss.item())
+            print(f"loss = {loss.item()}")
+
+            y_prob = torch.softmax(logits, dim=1).cpu().numpy()
+            results = {'slide_name': slide_id, 'score': y_prob[0][1].item(),
+                    'label': batch['labels'].to(args.device)[0].item()}
+            results_df = pd.concat([results_df, pd.DataFrame([results])], ignore_index=True)
+    
+    print(f'results_df = {results_df}')
+
+    # save results to csv
+    results_df.to_csv(os.path.join(args.save_dir, f'results_epoch_{epoch}.csv'), index=False)
+
+    avg_loss = np.mean(losses)
+    print(f"Epoch {epoch+1}: Average {'test' if args.run_inference else 'val'} loss: {avg_loss}")
+    return avg_loss
+
+
 def train(dataloader, fold, args):
     train_loader, val_loader, test_loader = dataloader
     # set up the writer
@@ -505,19 +636,38 @@ def train(dataloader, fold, args):
     elif "tensorboard" in args.report_to:
         writer = tensorboard.SummaryWriter(writer_dir, flush_secs=15)
     
+    print("Before model setup:")
+    print_free_gpu_memory(device=args.device)
+    if args.add_virchow2_features:
+        args.tile_input_dim += VIRCHOW2_FEATURE_DIM
+    if args.add_uni2_features:
+        args.tile_input_dim += UNI2_FEATURE_DIM
+    if args.add_conch_features:
+        args.tile_input_dim += CONCH_FEATURE_DIM
+
     # set up the model
-    if args.score_can_as_sb or args.score_can_as_bs or args.film:  # Delete
+    if (args.score_can_as_sb or args.score_can_as_bs or args.film) and not args.load_tile_logits and not args.tile_slide_model:  # Delete
         args.tile_model, model = get_model(**vars(args))
         args.tile_model = args.tile_model.to(args.device)
-        args.tile_model.load_state_dict(torch.load(args.tile_model_ckpt), strict=False)
-        args.tile_model.eval()
-        print("Loaded tile model")
-    else:
+        if not args.tile_slide_training:
+            args.tile_model.load_state_dict(torch.load(args.tile_model_ckpt), strict=False)
+            args.tile_model.eval()
+            print("Loaded tile model")
+    else:        
         model = get_model(**vars(args))
+        
     model = model.to(args.device)
+    print("After model setup:")
+    print_free_gpu_memory(device=args.device)
     
     # set up the optimizer
-    optimizer = get_optimizer(args, model)
+    if args.tile_slide_training and not args.tile_slide_model:
+        args.tile_optimizer = torch.optim.AdamW(args.tile_model.parameters(), lr=1e-4, weight_decay=1e-4)
+        optimizer = get_optimizer(args, model)
+    if args.cnn_on_y or args.train_on_y:
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-4)
+    else:
+        optimizer = get_optimizer(args, model)
     # set up the loss function
     loss_fn = get_loss_function(args)
     # set up the monitor
@@ -540,14 +690,12 @@ def train(dataloader, fold, args):
     print('Testing on {} samples'.format(len(test_loader.dataset))) if test_loader is not None else None
     print('Training starts!')
 
-    # test evaluate function
-    # val_records = evaluate(val_loader, model, fp16_scaler, loss_fn, 0, args)
-
     val_records, test_records = None, None
     loss_pe, lr_pe, val_loss_pe = [], [], [] # Delete
 
     for i in range(args.epochs):
         print('Epoch: {}'.format(i))
+        print_free_gpu_memory(device=args.device)
         args.output_dir = args.save_dir # Delete
         train_records = train_one_epoch(train_loader, model, fp16_scaler, optimizer, loss_fn, i, args)
         try:
@@ -588,8 +736,13 @@ def train(dataloader, fold, args):
             monitor(scores, model, ckpt_name=os.path.join(args.save_dir, 'fold_' + str(fold), "checkpoint.pt"))
         elif args.model_select == 'last_epoch' and i == args.epochs - 1:
             torch.save(model.state_dict(), os.path.join(args.save_dir, 'fold_' + str(fold), "checkpoint.pt"))
+            if args.tile_slide_training and not args.tile_slide_model:
+                torch.save(args.tile_model.state_dict(), os.path.join(args.save_dir, 'fold_' + str(fold), "tile_checkpoint.pt"))
         torch.save(model.state_dict(),
                    os.path.join(args.save_dir, 'fold_' + str(fold), 'model_epoch_' + str(i) + '_checkpoint.pt'))
+        if args.tile_slide_training and not args.tile_slide_model:
+            torch.save(args.tile_model.state_dict(), os.path.join(args.save_dir, 'fold_' + str(fold), 'model_epoch_' + str(i) + '_tile_checkpoint.pt'))
+        print_free_gpu_memory(device=args.device)
 
     # load model for test
     if test_loader is not None:
@@ -624,6 +777,8 @@ def train_one_epoch(train_loader, model, fp16_scaler, optimizer, loss_fn, epoch,
     seq_len = 0
     curr_len = 0
     max_num_samples = 40000
+    # max_num_samples = 25000
+    max_num_valid_samples = 16000
 
     # setup the records
     records = get_records_array(len(train_loader), args.n_classes, args)
@@ -650,10 +805,29 @@ def train_one_epoch(train_loader, model, fp16_scaler, optimizer, loss_fn, epoch,
     
     for batch_idx, batch in enumerate(train_loader):
         slide_id = batch['slide_id'][-1] 
+
+        # if batch_idx < 397:
+        #     continue
+
+        if args.window_training:            
+            sliding_window_ds = SlidingWindowDataset(data_df=args.dataset, root_path=args.root_path, task_config=args.task_config, slide_key=args.slide_key, label=args.label, \
+                                  dataset_name=args.test_dataset, folds=args.test_fold, use_clinical_features=args.clinical_features, test_on_all=args.test_on_all, 
+                                  get_single_slide=slide_id, window_size=args.window_size, stride=args.window_size, val_fold=args.val_fold[-1], only_matching_tiles=True)
+            window_loader = get_test_loader(sliding_window_ds, for_window=True, **vars(args))
+            slide_windows = [{'imgs': wndw['imgs'].to(args.device, non_blocking=True), 
+                              'coords': wndw['coords'].to(args.device, non_blocking=True), 
+                              'labels': wndw['labels'].to(args.device, non_blocking=True),
+                              'window_y': wndw['window_y'].to(args.device, non_blocking=True)} for wndw in window_loader]
+            len_windows = len(slide_windows)
+            print(f"Finished loading windows for slide {slide_id}, len(slide_windows) = {len_windows}")
+            if len_windows == 0:
+                continue
             
         # we use a per iteration lr scheduler
         if batch_idx % args.gc == 0 and args.lr_scheduler == 'cosine':
             adjust_learning_rate(optimizer, batch_idx / len(train_loader) + epoch, args)
+            if args.tile_slide_training and not args.tile_slide_model:
+               adjust_learning_rate(args.tile_optimizer, batch_idx / len(train_loader) + epoch, args) 
         num_tiles = batch['imgs'].shape[1]
         if num_tiles > max_num_samples:
             if not args.loss_fn == 'cox':
@@ -661,81 +835,189 @@ def train_one_epoch(train_loader, model, fp16_scaler, optimizer, loss_fn, epoch,
             indices = torch.randint(low=0, high=num_tiles, size=(max_num_samples,))
             slice_tiles(indices=indices, batch=batch)
 
+        print('Before loading batch')
+        print_free_gpu_memory(device=args.device)
         # ********** load the batch and transform this batch **********
-        images, img_coords, label = batch['imgs'], batch['coords'], batch['labels']
-        print(f'slide_id = {slide_id}, label = {label}')
-        ihc_images, ihc_coords, matching_tiles = batch['ihc_imgs'], batch['ihc_coords'], batch['matching_tiles'] # Delete
-        tumor_indices, non_tumor_indices, cancer_prob = batch['tumor_indices'], batch['non_tumor_indices'], batch.get('cancer_prob', None)
-        tile_y = batch['tile_y']
-        synth_ihc_images = batch['synth_ihc_imgs'] # Delete
-
-        if args.survival:
-            censoreship = batch['censoreship']
-        # ********** data preperation and move to device **********
-        images = images.to(args.device, non_blocking=True)
-        img_coords = img_coords.to(args.device, non_blocking=True)
-        label = label.to(args.device, non_blocking=True) # .long()
-        if ihc_images is not None:
-            ihc_images = ihc_images.to(args.device, non_blocking=True)
-            ihc_coords = ihc_coords.to(args.device, non_blocking=True)
-
-        if args.synth_ihc_train:
-            synth_ihc_images = synth_ihc_images.to(args.device, non_blocking=True)
-        if args.predict_cancer and tumor_indices is not None:
-            # init local_tumor_labels as zeros_like(images) and then fill the tumor indices with 1
-            local_tumor_labels = torch.zeros(images.shape[:2], device=images.device)
-            print(f"tumor_indices.shape = {tumor_indices.shape}")
-            local_tumor_labels[:, tumor_indices] = 1
-            tumor_indices = tumor_indices.to(args.device, non_blocking=True)
-            if non_tumor_indices is not None:
-                non_tumor_indices = non_tumor_indices.to(args.device, non_blocking=True)
-
-            if args.only_annotated_tiles:
-                annotated_indices = torch.cat([tumor_indices, non_tumor_indices], dim=-1).long()
-                images = images[:, annotated_indices].squeeze(0)
-                img_coords = img_coords[:, annotated_indices].squeeze(0)
-                local_tumor_labels = local_tumor_labels[:, annotated_indices].squeeze(0)
-        if args.cat_y or args.pred_from_tumor: # Delete:
-            if matching_tiles is not None:
-                matching_tiles = matching_tiles.to(args.device, non_blocking=True)
-                valid_matching_tiles = (~torch.isnan(matching_tiles)) & (matching_tiles < ihc_images.shape[1])
-                if len(torch.nonzero(valid_matching_tiles)) == 0:
-                    print(f"{batch['slide_id']} has no valid matching tiles, skipping")
+        if not args.window_training:
+            images, img_coords, label = batch['imgs'], batch['coords'], batch['labels']
+            print(f'slide_id = {slide_id}, label = {label}')
+            ihc_images, ihc_coords, matching_tiles = batch['ihc_imgs'], batch['ihc_coords'], batch['matching_tiles'] # Delete
+            tumor_indices, non_tumor_indices, cancer_prob = batch['tumor_indices'], batch['non_tumor_indices'], batch.get('cancer_prob', None)
+            tile_y = batch['tile_y']
+            if args.cnn_on_y:
+                tiles = batch['tiles']
+                # check if tiles is a tensor larger than 0
+                if tiles is None or not (isinstance(tiles, torch.Tensor) and tiles.numel() > 0):
+                    print(f"tiles is None or not a valid tensor for slide {batch['slide_id']}, skipping")
                     continue
+            synth_ihc_images = batch['synth_ihc_imgs'] # Delete
+            if args.load_tile_logits:
+                tile_logits = batch['tile_logits']
+            if args.add_virchow2_features:
+                virchow2_feats = batch['virchow2_feats']
+            if args.add_uni2_features:
+                uni2_feats = batch['uni2_feats']
+            if args.add_conch_features:
+                conch_feats = batch['conch_feats']
+            if args.external_model_logits:
+                external_tile_logits = batch['external_tile_logits']
 
-                elif args.cat_y or args.pred_from_tumor: # Delete
-                    images = images[valid_matching_tiles]
-                    img_coords = img_coords[valid_matching_tiles]
-                    matching_tiles = matching_tiles[valid_matching_tiles].int()
-                    if args.cat_y:
-                        if tile_y is not None:
-                            tile_y = tile_y.to(args.device, non_blocking=True)
-                            tile_y = tile_y.squeeze(0)
-                        else:
-                            print(f"{batch['slide_id']} tile_y is None, skipping")
-                            continue
+            if args.survival:
+                censoreship = batch['censoreship']
+        # ********** data preperation and move to device **********
+        if not args.window_training:
+            images = images.to(args.device, non_blocking=True)
+            img_coords = img_coords.to(args.device, non_blocking=True)
+            label = label.to(args.device, non_blocking=True) # .long()
+            if ihc_images is not None:
+                ihc_images = ihc_images.to(args.device, non_blocking=True)
+                ihc_coords = ihc_coords.to(args.device, non_blocking=True)
 
-                    if args.only_tumor_tiles:
-                        if tumor_indices is not None and tumor_indices.shape[-1] > 0:
-                            tumor_indices = tumor_indices.squeeze(0)
-                            images = images[tumor_indices]
-                            img_coords = img_coords[tumor_indices]
-                            if args.cat_y:
-                                tile_y = tile_y[tumor_indices]
-                        else:
-                            print(f"{batch['slide_id']} has no tumor indices, skipping")
-                            continue
-                else:
-                    matching_tiles = matching_tiles[valid_matching_tiles].int()
-                # print(f"valid_matching_tiles = {valid_matching_tiles}, matching_tiles = {matching_tiles}, matching_tiles.shape = {matching_tiles.shape}")
-            else:
-                print(f"{batch['slide_id']} matching_tiles is None, skipping")
-                continue    
+            if args.synth_ihc_train:
+                synth_ihc_images = synth_ihc_images.to(args.device, non_blocking=True)
+            if args.predict_cancer and tumor_indices is not None:
+                # init local_tumor_labels as zeros_like(images) and then fill the tumor indices with 1
+                local_tumor_labels = torch.zeros(images.shape[:2], device=images.device)
+                print(f"tumor_indices.shape = {tumor_indices.shape}")
+                local_tumor_labels[:, tumor_indices] = 1
+                tumor_indices = tumor_indices.to(args.device, non_blocking=True)
+                if non_tumor_indices is not None:
+                    non_tumor_indices = non_tumor_indices.to(args.device, non_blocking=True)
+
+                if args.only_annotated_tiles:
+                    annotated_indices = torch.cat([tumor_indices, non_tumor_indices], dim=-1).long()
+                    images = images[:, annotated_indices].squeeze(0)
+                    img_coords = img_coords[:, annotated_indices].squeeze(0)
+                    local_tumor_labels = local_tumor_labels[:, annotated_indices].squeeze(0)
             
+            if args.only_tumor_tiles:
+                if tumor_indices is not None and tumor_indices.shape[-1] > 0:
+                    tumor_indices = tumor_indices.squeeze(0)
+                    images = images[tumor_indices]
+                    img_coords = img_coords[tumor_indices]
+                else:
+                    print(f"{batch['slide_id']} has no tumor indices, skipping")
+                    continue
+                    
+            if args.cat_y or args.paired_training_mw or args.tile_slide_training: # Delete:
+                if matching_tiles is not None:
+                    matching_tiles = matching_tiles.to(args.device, non_blocking=True)
+                    valid_matching_tiles = ((~torch.isnan(matching_tiles)) & (matching_tiles < ihc_images.shape[1])).flatten()
+                    if len(torch.nonzero(valid_matching_tiles)) == 0:
+                        print(f"{batch['slide_id']} has no valid matching tiles, skipping")
+                        continue
 
-        # add the sequence length
-        seq_len += images.shape[-2]
-        curr_len += images.shape[-2]
+                    elif args.cat_y or args.paired_training_mw or args.tile_slide_training: # Delete
+                    # else:
+                        if args.malig_paired_mw and tumor_indices is not None and tumor_indices.shape[-1] > 0:
+                            # get the indices of true values in valid_matching_tiles
+                            valid_matching_indices = torch.nonzero(valid_matching_tiles.clone().flatten()).long().flatten()
+                            tumor_in_non_nan = np.isin(valid_matching_indices.cpu().numpy(), tumor_indices.cpu().numpy())
+                            tumor_matching_indices = np.where(tumor_in_non_nan)[0]
+                            valid_tumor_matching_indices = valid_matching_indices[tumor_matching_indices].flatten()
+                            if args.replace_benign_w_zero:
+                                # get all indices which are in valid_matching_indices and not on valid_tumor_matching_indices without a for loop
+                                non_tumor_matching_indices = np.setdiff1d(valid_matching_indices.cpu().numpy(), valid_tumor_matching_indices.cpu().numpy())
+                                non_tumor_matching_tiles = matching_tiles.clone().flatten()[non_tumor_matching_indices].long().flatten()
+                                images, img_coords = images[:, valid_matching_indices], img_coords[:, valid_matching_indices]
+                                matching_tiles = matching_tiles.flatten()[valid_matching_indices].long().flatten()
+                                # fill the non matching indices with zero vectors
+                                ihc_images[:, non_tumor_matching_tiles] = 0
+                            else:
+                                matching_tiles = matching_tiles.flatten()[valid_tumor_matching_indices].long()
+                                images, img_coords = images[:, valid_tumor_matching_indices], img_coords[:, valid_tumor_matching_indices]        
+                        else:
+                            images = images[:, valid_matching_tiles]
+                            img_coords = img_coords[:, valid_matching_tiles]
+                            matching_tiles = matching_tiles[:, valid_matching_tiles].long().flatten()
+                            
+                        if args.malig_paired_mw:
+                            ihc_images = ihc_images[:, matching_tiles]
+
+                        if cancer_prob is not None:
+                            cancer_prob = cancer_prob.to(args.device, non_blocking=True)[:, valid_matching_tiles]
+
+                        if args.cat_y or args.tile_slide_training:
+                            if tile_y is not None:
+                                tile_y = tile_y.to(args.device, non_blocking=True)
+                                tile_y = tile_y.squeeze(0)
+                            else:
+                                print(f"{batch['slide_id']} tile_y is None, skipping")
+                                continue
+
+                        if args.cnn_on_y:
+                            tiles = tiles.to(args.device, non_blocking=True)
+                            # tiles = tiles[valid_matching_tiles]
+
+                        if args.add_virchow2_features:
+                            print(f'images.shape before adding virchow2 features = {images.shape}, virchow2_feats.shape = {virchow2_feats.shape}')
+                            virchow2_feats = virchow2_feats.to(args.device, non_blocking=True)
+                            virchow2_feats = virchow2_feats[valid_matching_tiles]
+                            virchow2_feats = virchow2_feats.view(-1, VIRCHOW2_FEATURE_DIM)
+                            images = torch.cat([images, virchow2_feats], dim=-1)
+                        
+                        if args.add_uni2_features:
+                            print(f'images.shape before adding uni2 features = {images.shape}, uni2_feats.shape = {uni2_feats.shape}')
+                            uni2_feats = uni2_feats.to(args.device, non_blocking=True)
+                            uni2_feats = uni2_feats[valid_matching_tiles]
+                            uni2_feats = uni2_feats.view(-1, UNI2_FEATURE_DIM)
+                            images = torch.cat([images, uni2_feats], dim=-1)
+                        
+                        if args.add_conch_features:
+                            print(f'images.shape before adding conch features = {images.shape}, conch_feats.shape = {conch_feats.shape}')
+                            conch_feats = conch_feats.to(args.device, non_blocking=True)
+                            conch_feats = conch_feats[valid_matching_tiles]
+                            conch_feats = conch_feats.view(-1, CONCH_FEATURE_DIM)
+                            images = torch.cat([images, conch_feats], dim=-1)
+
+                        num_valid_tiles = images.shape[-2]
+                        print(f'num_valid_tiles = {num_valid_tiles}')
+                        if args.tile_slide_model and num_valid_tiles > max_num_valid_samples:
+                            indices = torch.randint(low=0, high=num_valid_tiles, size=(max_num_valid_samples,))
+                            images = images[indices]
+                            img_coords = img_coords[indices]
+                            if tile_y is not None:
+                                tile_y = tile_y[indices]
+                            if cancer_prob is not None:
+                                cancer_prob = cancer_prob[indices]
+                            if virchow2_feats is not None:
+                                virchow2_feats = virchow2_feats[indices]
+                            if uni2_feats is not None:
+                                uni2_feats = uni2_feats[indices]
+                            print(f"After slicing, images.shape = {images.shape}")
+                        
+                        if args.external_model_logits:
+                            external_tile_logits = external_tile_logits.to(args.device, non_blocking=True)
+                            external_tile_logits = external_tile_logits[valid_matching_tiles]
+                        
+                        images = images.view(1, -1, args.tile_input_dim)
+                        
+                        if args.y_and_tumor_from_map and not args.cnn_on_y:
+                            # only keep tile_y values that are not -1
+                            valid_tile_y_indices = (tile_y != -1) & (tile_y != 0)
+                            images = images[valid_tile_y_indices]
+                            if images.size(0) == 0:
+                                print(f"{batch['slide_id']} has no valid tile_y indices, skipping")
+                                continue
+                            img_coords = img_coords[valid_tile_y_indices]
+                            tile_y = tile_y[valid_tile_y_indices].view(-1, 1)
+                            # if args.cnn_on_y:
+                            #     tiles = tiles[valid_tile_y_indices]
+                    else:
+                        matching_tiles = matching_tiles[valid_matching_tiles].int()
+                        
+                            
+                    # print(f"valid_matching_tiles = {valid_matching_tiles}, matching_tiles = {matching_tiles}, matching_tiles.shape = {matching_tiles.shape}")
+                else:
+                    print(f"{batch['slide_id']} matching_tiles is None, skipping")
+                    continue    
+        
+            print('After loading batch')
+            print_free_gpu_memory(device=args.device)
+
+            # add the sequence length
+            seq_len += images.shape[-2]
+            curr_len += images.shape[-2]
 
         with torch.cuda.amp.autocast(dtype=torch.float16 if args.fp16 else torch.float32):
             # ********** get the logits **********
@@ -743,46 +1025,93 @@ def train_one_epoch(train_loader, model, fp16_scaler, optimizer, loss_fn, epoch,
                 images, img_coords = images.transpose(0, 1), img_coords.transpose(0, 1)
                 local_tumor_labels = local_tumor_labels.squeeze(0).long()
                 print(f'images.shape = {images.shape}, local_tumor_labels.shape = {local_tumor_labels.shape}')
-                logits = model(images, img_coords)    
+                logits = model(images, img_coords)
 
             elif args.cat_y:
-                matching_ihc_images = ihc_images.squeeze(0)[matching_tiles]
                 if args.train_on_y:
-                    images, img_coords = images.unsqueeze(0).transpose(0, 1), img_coords.unsqueeze(0).transpose(0, 1)
+                    images, img_coords = images.view(-1, 1, args.tile_input_dim), img_coords.view(-1, 1, 2)
                     print(f'images.shape = {images.shape}')
                     if images.shape[0] == 0:
                         print(f"slide {batch['slide_id']} has no matching ihc images, skipping")
                         continue
                     
                     tile_log_vars = None
-                    if not args.conf_score:
+                    if args.cnn_on_y:
+                        tiles = tiles.view(-1, 3, args.tile_size, args.tile_size)
+                        print(f'tiles.shape = {tiles.shape} before model call')
+                        tile_logits = model(tiles)
+                        print(f'tile_logits.shape = {tile_logits.shape} after model call')
+                        logits = tile_logits.mean()
+
+                    elif not args.conf_score:
                         logits, tile_logits = model(images, img_coords)
                     else:
                         logits, tile_logits, tile_log_vars = model(images, img_coords, return_conf=True)
 
-            elif args.score_can_as_sb or args.score_can_as_bs or args.film:
-                _, tile_logits = args.tile_model(images, img_coords)
+            elif args.score_can_as_sb or args.score_can_as_bs or args.film or args.weighted_film:
                 cancer_prob = cancer_prob.to(args.device, non_blocking=True)
-                if not args.film:
-                    logits = model(images, img_coords, tile_scores=tile_logits, tile_cancer_probs=cancer_prob, score_as_scale=args.score_can_as_sb)
+                if args.tile_slide_model:
+                    images, img_coords = images.view(-1, 1, args.tile_input_dim), img_coords.view(-1, 1, 2)
+                    if args.use_tile_classifier:
+                        tile_logits = model(images, img_coords, predict_tile_logits=True, tile_classifier=True)
+                    else:
+                        tile_logits = model(images, img_coords, predict_tile_logits=True)
+                elif args.load_tile_logits:
+                    tile_logits = tile_logits.to(args.device, non_blocking=True)
                 else:
-                    logits = model(images, img_coords, tile_scores=tile_logits, tile_cancer_probs=cancer_prob, film=args.film)
+                    images, img_coords = images.view(-1, 1, args.tile_input_dim), img_coords.view(-1, 1, 2)
+                    _, tile_logits = args.tile_model(images, img_coords)
+                
+                images = images[:,:, :args.input_dim]
+                images, img_coords = images.view(1, -1, args.input_dim), img_coords.view(1, -1, 2)
+                if args.weighted_film:
+                    logits = model(images, img_coords, tile_scores=tile_logits, tile_cancer_probs=cancer_prob, weighted_film=args.weighted_film)
+                elif not args.film:
+                    logits = model(images, img_coords, tile_scores=tile_logits, tile_cancer_probs=cancer_prob, score_as_scale=args.score_can_as_sb)
+                else:  # args.film
+                    if args.const_tl:
+                        tile_logits = torch.full_like(tile_logits, 3)
+                    elif args.const_cp:
+                        cancer_prob = torch.full_like(cancer_prob, 1)
+
+                    if args.external_model_logits:
+                        logits = model(images, img_coords, tile_scores=tile_logits, tile_cancer_probs=cancer_prob, external_model_scores=external_tile_logits, film=args.film)
+                    else:
+                        logits = model(images, img_coords, tile_scores=tile_logits, tile_cancer_probs=cancer_prob, film=args.film)
 
             elif args.synth_ihc_train: # Delete
                 images = torch.cat([images, synth_ihc_images], dim=-1)
                 logits = model(images, img_coords)
+            elif args.window_training:
+                window_logits = []
+                for window in slide_windows:
+                    wndw_logits = model(window['imgs'], window['coords'])
+                    window_logits.append(wndw_logits)
+                window_logits = torch.stack(window_logits).view(len_windows, -1)
+            elif args.paired_training_mw:
+                if args.paired_mw_w_cancer:
+                    logits = model(images, img_coords, ihc_images, modality_weights=True, cancer_weights=True, tile_cancer_probs=cancer_prob)
+                elif args.paired_mw_cancer_scale:
+                    logits = model(images, img_coords, ihc_images, modality_weights=True, tile_cancer_probs=cancer_prob, cancer_scale=True)
+                else:
+                    logits = model(images, img_coords, ihc_images, modality_weights=True)
+            elif args.paired_training_mb:
+                logits = model(images, img_coords, ihc_images, ihc_coords, modality_bias=True)
+            elif args.paired_training_cat_h:
+                logits = model(images, img_coords, ihc_images, ihc_coords, concat_h=True)
             else:
                 logits = model(images, img_coords)
                 print(f"logits = {logits}, shape = {logits.shape}")
 
             # ********** Shapes and types before loss **********
-            if isinstance(loss_fn, torch.nn.BCEWithLogitsLoss):
-                label = label.squeeze(-1).float()    
-            elif (args.task_config.get('setting', 'multi_class') == 'continuous' and not args.loss_fn == 'cox') or args.task_config.get('setting', 'multi_class') == 'multi_class':
-                label = label.squeeze(-1).float()
-                logits = logits.squeeze(-1)
-            else:
-                label = label.squeeze(-1) # .long()                 
+            if not args.window_training:
+                if isinstance(loss_fn, torch.nn.BCEWithLogitsLoss):
+                    label = label.squeeze(-1).float()    
+                elif (args.task_config.get('setting', 'multi_class') == 'continuous' and not args.loss_fn == 'cox') or args.task_config.get('setting', 'multi_class') == 'multi_class':
+                    label = label.squeeze(-1).float()
+                    logits = logits.squeeze(-1)
+                else:
+                    label = label.squeeze(-1) # .long()                 
 
             # ********** loss computation **********
             if not args.loss_fn == 'cox':
@@ -795,15 +1124,18 @@ def train_one_epoch(train_loader, model, fp16_scaler, optimizer, loss_fn, epoch,
                             # print(f"tile_y = {tile_y}, shape = {tile_y.shape}")
                         # tile_y_scaled = tile_y / 3
 
+                        elif not tile_logits.shape == tile_y.shape:
+                            tile_logits = tile_logits.view(-1)
+                            tile_y = tile_y.view(-1)
+
                         if not args.conf_score:
-                           tile_loss = loss_fn(tile_logits, tile_y)
-                            # tile_loss = a_mse(tile_logits, tile_y)
+                            tile_loss = loss_fn(tile_logits, tile_y)
                         else:
                             tile_vars = torch.exp(tile_log_vars)
                             tile_loss = gnll(tile_logits, tile_y.float(), tile_vars) + tile_vars.mean()
                         
                         margin, spearman = None, None
-                        spearman = loss_spear(tile_logits, tile_y)                       
+                        spearman = loss_spear(tile_logits, tile_y) if not args.task_config.get('setting', 'multi_class') == 'binary' else None
                         
                         # if label.item() in [0, 0.5, 1]:
                         #     if len(tile_logits[tile_y < 0.5]) > 0:
@@ -832,13 +1164,25 @@ def train_one_epoch(train_loader, model, fp16_scaler, optimizer, loss_fn, epoch,
                         #     else:
                         #         loss = tile_loss + spearman
                         # else:
-                        loss = tile_loss # + spearman # + slide_loss 
+                        loss = tile_loss # + spearman # + slide_loss
                             
                         # loss = tile_loss + spearman if epoch >= 2 else tile_loss
                         print(f"tile_loss = {tile_loss}, margin_loss = {margin}, spearman = {spearman}, loss = {loss}") # slide_loss = {slide_loss},
                         print(f"tile_y = {tile_y}, tile_logits = {tile_logits}, logits = {logits}, label = {label}") # tile_vars = {tile_vars}, 
                     elif args.predict_cancer and tumor_indices is not None:
                         loss = loss_fn(logits, local_tumor_labels)
+                    elif args.window_training:
+                        window_labels = torch.stack([wndw['window_y'] for wndw in slide_windows])
+                        print(f"window_logits = {window_logits}, window_labels = {window_labels}")
+                        loss = loss_fn(window_logits, window_labels)
+                        print(f"loss = {loss}")
+                        logits = window_logits.mean(dim=0) # for evaluation records
+                    elif args.tile_slide_training:
+                        tile_loss = loss_fn(tile_logits.view(-1), tile_y.view(-1))
+                        slide_loss = loss_fn(logits, label)
+                        loss = tile_loss + slide_loss
+                        print(f"tile_loss = {tile_loss}, slide_loss = {slide_loss}, loss = {loss}")
+                        print(f"tile_y = {tile_y}, tile_logits = {tile_logits}, logits = {logits}, label = {label}")
                     else:
                         loss = loss_fn(logits, label)
                         print(f"loss = {loss}")
@@ -850,6 +1194,8 @@ def train_one_epoch(train_loader, model, fp16_scaler, optimizer, loss_fn, epoch,
                 cum_logits[curr_idx] = logits[0]
                 cum_labels[curr_idx] = label[0]
                 cum_censoreship[curr_idx] = censoreship[0]
+
+            # ********** backward step **********
             if fp16_scaler is None:
                 if not args.loss_fn == 'cox':
                     loss.backward()
@@ -883,6 +1229,9 @@ def train_one_epoch(train_loader, model, fp16_scaler, optimizer, loss_fn, epoch,
                             loss.backward()
                             optimizer.step()
                             optimizer.zero_grad()
+                            if args.tile_slide_training and not args.tile_slide_model:
+                                args.tile_optimizer.step()
+                                args.tile_optimizer.zero_grad()
                             print(f"performed step on {curr_len} tiles")
                             curr_len = 0
                             cum_logits = torch.zeros([args.gc])
@@ -896,8 +1245,8 @@ def train_one_epoch(train_loader, model, fp16_scaler, optimizer, loss_fn, epoch,
                         curr_len = 0
             else:
                 if not args.loss_fn == 'cox':                    
-                    fp16_scaler.scale(loss).backward(retain_graph=True)
-                    # fp16_scaler.scale(loss).backward()
+                    # fp16_scaler.scale(loss).backward(retain_graph=True)
+                    fp16_scaler.scale(loss).backward()
                     # print("Classifier weight grad norm:", model.classifier[0].weight.grad) # Delete .norm()
                     
                 # update the parameters with gradient accumulation
@@ -939,6 +1288,10 @@ def train_one_epoch(train_loader, model, fp16_scaler, optimizer, loss_fn, epoch,
                         fp16_scaler.step(optimizer)
                         fp16_scaler.update()
                         optimizer.zero_grad()
+                        if args.tile_slide_training and not args.tile_slide_model:
+                            fp16_scaler.step(args.tile_optimizer)
+                            fp16_scaler.update()
+                            args.tile_optimizer.zero_grad()
                         print(f"performed step on {curr_len} tiles")
                         curr_len = 0
 
@@ -973,7 +1326,7 @@ def evaluate(loader, model, fp16_scaler, loss_fn, epoch, args, save_embed=False)
     if args.predict_cancer or args.pred_y_baseline or args.pred_y:
         records['prob'] = []
         records['label'] = []
-    embeds = np.zeros((len(loader), 768))
+    embeds = np.zeros((len(loader), 768)) if not args.paired_training_cat_h else np.zeros((len(loader), 768*2)) # Delete
 
     # get the task setting
     task_setting = args.task_config.get('setting', 'multi_class')
@@ -992,101 +1345,263 @@ def evaluate(loader, model, fp16_scaler, loss_fn, epoch, args, save_embed=False)
             max_num_samples = 1000
         for batch_idx, batch in enumerate(loader):
             slide_id = batch['slide_id'][-1] 
-            # if not slide_id.startswith('21-6140'):
+            # if not slide_id.startswith('19-14590_1_1'):
             #     continue
+            # if batch_idx > 3:
+            #     break
+
+            if args.window_training:            
+                sliding_window_ds = SlidingWindowDataset(data_df=args.dataset, root_path=args.root_path, task_config=args.task_config, slide_key=args.slide_key, label=args.label, \
+                                    dataset_name=args.test_dataset, folds=args.test_fold, use_clinical_features=args.clinical_features, test_on_all=args.test_on_all, 
+                                    get_single_slide=slide_id, window_size=args.window_size, stride=args.window_size, val_fold=args.val_fold[-1], only_matching_tiles=True)
+                window_loader = get_test_loader(sliding_window_ds, for_window=True, **vars(args))
+                slide_windows = [{'imgs': wndw['imgs'].to(args.device, non_blocking=True), 
+                                'coords': wndw['coords'].to(args.device, non_blocking=True), 
+                                'labels': wndw['labels'].to(args.device, non_blocking=True),
+                                'window_y': wndw['window_y'].to(args.device, non_blocking=True)} for wndw in window_loader]
+                label = batch['labels'].to(args.device, non_blocking=True).view(-1)
+                len_windows = len(slide_windows)
+                print(f"Finished loading windows for slide {slide_id}, len(slide_windows) = {len_windows}")
+                if len_windows == 0:
+                    continue
 
             # ********** load the batch and transform this batch **********
-            num_tiles = batch['imgs'].shape[1]
-            if args.loss_fn == 'cox' and num_tiles > max_num_samples:
-                indices = torch.randint(low=0, high=num_tiles, size=(max_num_samples,))
-                slice_tiles(indices=indices, batch=batch)
+            if not args.window_training:
+                num_tiles = batch['imgs'].shape[1]
+                if args.loss_fn == 'cox' and num_tiles > max_num_samples:
+                    indices = torch.randint(low=0, high=num_tiles, size=(max_num_samples,))
+                    slice_tiles(indices=indices, batch=batch)
 
-            images, img_coords, label, ihc_images, ihc_coords = batch['imgs'], batch['coords'], batch['labels'], batch['ihc_imgs'], batch['ihc_coords']
-            matching_tiles, tile_y = batch['matching_tiles'], batch['tile_y']
-            tumor_indices, non_tumor_indices, cancer_prob = batch['tumor_indices'], batch['non_tumor_indices'], batch.get('cancer_prob', None)
-            synth_ihc_images = batch['synth_ihc_imgs'] # Delete           
+                images, img_coords, label, ihc_images, ihc_coords = batch['imgs'], batch['coords'], batch['labels'], batch['ihc_imgs'], batch['ihc_coords']
+                matching_tiles, tile_y = batch['matching_tiles'], batch['tile_y']
+                tumor_indices, non_tumor_indices, cancer_prob = batch['tumor_indices'], batch['non_tumor_indices'], batch.get('cancer_prob', None)
+                synth_ihc_images = batch['synth_ihc_imgs'] # Delete
+                if args.load_tile_logits:
+                    tile_logits = batch['tile_logits']
+                if args.add_virchow2_features:
+                    virchow2_feats = batch['virchow2_feats']
+                if args.add_uni2_features:
+                    uni2_feats = batch['uni2_feats']
+                if args.add_conch_features:
+                    conch_feats = batch['conch_feats']
+                if args.external_model_logits:
+                    external_tile_logits = batch['external_tile_logits']
+                if args.cnn_on_y:
+                    tiles = batch['tiles']
+                    # check if tiles is a tensor larger than 0
+                    if tiles is None or not (isinstance(tiles, torch.Tensor) and tiles.numel() > 0):
+                        print(f"tiles is None or not a valid tensor for slide {batch['slide_id']}, skipping")
+                        continue
             # ********** data preperation and move to device **********
-            print(f"slide = {slide_id}, batch_idx = {batch_idx}, label = {label}")
+            print(f"slide = {slide_id}, batch_idx = {batch_idx}")  # , label = {label}
             # if slide_id != "21-8662_1_1_e":
                 # continue
-            images = images.to(args.device, non_blocking=True)
-            img_coords = img_coords.to(args.device, non_blocking=True)
-            label = label.to(args.device, non_blocking=True).long()
-            if ihc_images is not None:
-                ihc_images = ihc_images.to(args.device, non_blocking=True)
-                ihc_coords = ihc_coords.to(args.device, non_blocking=True)
+            if not args.window_training:
+                images = images.to(args.device, non_blocking=True)
+                img_coords = img_coords.to(args.device, non_blocking=True)
+                label = label.to(args.device, non_blocking=True).long()
+                if ihc_images is not None:
+                    ihc_images = ihc_images.to(args.device, non_blocking=True)
+                    ihc_coords = ihc_coords.to(args.device, non_blocking=True)
 
-            if args.predict_cancer:
-                # init local_tumor_labels as zeros_like(images) and then fill the tumor indices with 1
-                local_tumor_labels = torch.zeros(images.shape[:2], device=images.device)
-                if tumor_indices is not None:
-                    print(f"tumor_indices.shape = {tumor_indices.shape}")
-                    if tumor_indices.shape[-1] > 0:
-                        local_tumor_labels[:, tumor_indices] = 1
-                    tumor_indices = tumor_indices.to(args.device, non_blocking=True)
-                    if non_tumor_indices is not None:
-                        non_tumor_indices = non_tumor_indices.to(args.device, non_blocking=True)
+                if args.predict_cancer:
+                    # init local_tumor_labels as zeros_like(images) and then fill the tumor indices with 1
+                    local_tumor_labels = torch.zeros(images.shape[:2], device=images.device)
+                    if tumor_indices is not None:
+                        print(f"tumor_indices.shape = {tumor_indices.shape}")
+                        if tumor_indices.shape[-1] > 0:
+                            local_tumor_labels[:, tumor_indices] = 1
+                        tumor_indices = tumor_indices.to(args.device, non_blocking=True)
+                        if non_tumor_indices is not None:
+                            non_tumor_indices = non_tumor_indices.to(args.device, non_blocking=True)
 
-                if args.only_annotated_tiles:
-                    annotated_indices = torch.cat([tumor_indices, non_tumor_indices], dim=-1).long()
-                    images = images[:, annotated_indices].squeeze(0)
-                    img_coords = img_coords[:, annotated_indices].squeeze(0)
-                    local_tumor_labels = local_tumor_labels[:, annotated_indices].squeeze(0)
+                    if args.only_annotated_tiles:
+                        annotated_indices = torch.cat([tumor_indices, non_tumor_indices], dim=-1).long()
+                        images = images[:, annotated_indices].squeeze(0)
+                        img_coords = img_coords[:, annotated_indices].squeeze(0)
+                        local_tumor_labels = local_tumor_labels[:, annotated_indices].squeeze(0)
 
-            if args.synth_ihc_train:
-                synth_ihc_images = synth_ihc_images.to(args.device, non_blocking=True)
+                if args.synth_ihc_train:
+                    synth_ihc_images = synth_ihc_images.to(args.device, non_blocking=True)
 
-            if args.cat_y or args.pred_from_tumor: # Delete:
-                if matching_tiles is not None:
-                    matching_tiles = matching_tiles.to(args.device, non_blocking=True)
-                    valid_matching_tiles = (~torch.isnan(matching_tiles)) & (matching_tiles < ihc_images.shape[1])
-                    if len(torch.nonzero(valid_matching_tiles)) == 0:
-                        print(f"{batch['slide_id']} has no valid matching tiles, skipping")
+                if args.only_tumor_tiles:
+                    if tumor_indices is not None and tumor_indices.shape[-1] > 0:
+                        print(f'tumor_indices.shape = {tumor_indices.shape}, images.shape = {images.shape}, img_coords.shape = {img_coords.shape}')
+                        print(f'tumor_indices = {tumor_indices}')
+                        tumor_indices = tumor_indices.view(-1)
+                        images = images[:, tumor_indices]
+                        img_coords = img_coords[:, tumor_indices]
+                    else:
+                        print(f"{batch['slide_id']} has no tumor indices, skipping")
                         continue
-                    images = images[valid_matching_tiles]
-                    img_coords = img_coords[valid_matching_tiles]
-                    matching_tiles = matching_tiles[valid_matching_tiles].int()
-                    if args.cat_y and not args.create_y:
-                        if tile_y is not None:
-                            tile_y = tile_y.to(args.device, non_blocking=True).squeeze(0)
-                        else:
-                            print(f"{batch['slide_id']} tile_y is None, skipping")
+
+                if (args.cat_y or args.paired_training_mw or args.tile_slide_training) and not args.all_he_tiles: # Delete:
+                    if matching_tiles is not None:
+                        matching_tiles = matching_tiles.to(args.device, non_blocking=True)
+                        valid_matching_tiles = ((~torch.isnan(matching_tiles)) & (matching_tiles < ihc_images.shape[1])).flatten()
+                        if len(torch.nonzero(valid_matching_tiles)) == 0:
+                            print(f"{batch['slide_id']} has no valid matching tiles, skipping")
                             continue
-                    if args.only_tumor_tiles:
-                        if tumor_indices is not None and tumor_indices.shape[-1] > 0:
-                            print(f'tile_y.shape = {tile_y.shape}, tumor_indices.shape = {tumor_indices.shape}, images.shape = {images.shape}, img_coords.shape = {img_coords.shape}')
-                            print(f'tumor_indices = {tumor_indices}')
-                            tumor_indices = tumor_indices.squeeze(0)
-                            images = images[tumor_indices]
-                            img_coords = img_coords[tumor_indices]
-                            if args.cat_y:
-                                tile_y = tile_y[tumor_indices]
+                        if args.malig_paired_mw and tumor_indices is not None and tumor_indices.shape[-1] > 0:
+                            # get the indices of true values in valid_matching_tiles
+                            valid_matching_indices = torch.nonzero(valid_matching_tiles.clone().flatten()).long().flatten()
+                            tumor_in_non_nan = np.isin(valid_matching_indices.cpu().numpy(), tumor_indices.cpu().numpy())
+                            tumor_matching_indices = np.where(tumor_in_non_nan)[0]
+                            valid_tumor_matching_indices = valid_matching_indices[tumor_matching_indices].flatten()
+                            if args.replace_benign_w_zero:
+                                # get all indices which are in valid_matching_indices and not on valid_tumor_matching_indices without a for loop
+                                non_tumor_matching_indices = np.setdiff1d(valid_matching_indices.cpu().numpy(), valid_tumor_matching_indices.cpu().numpy())
+                                non_tumor_matching_tiles = matching_tiles.clone().flatten()[non_tumor_matching_indices].long().flatten()
+                                images, img_coords = images[:, valid_matching_indices], img_coords[:, valid_matching_indices]
+                                matching_tiles = matching_tiles.flatten()[valid_matching_indices].long().flatten()
+                                # fill the non matching indices with zero vectors
+                                ihc_images[:, non_tumor_matching_tiles] = 0    
+                            else:
+                                matching_tiles = matching_tiles.flatten()[valid_tumor_matching_indices].long()
+                                images, img_coords = images[:, valid_tumor_matching_indices], img_coords[:, valid_tumor_matching_indices]
+                                    
                         else:
-                            print(f"{batch['slide_id']} has no tumor indices, skipping")
-                            continue
-                else:
-                    print(f"{batch['slide_id']} matching_tiles is None, skipping")
-                    continue
+                            images = images[:, valid_matching_tiles]
+                            img_coords = img_coords[:, valid_matching_tiles]
+                            matching_tiles = matching_tiles[:, valid_matching_tiles].long().flatten()
+
+                        if args.malig_paired_mw:
+                            ihc_images = ihc_images[:, matching_tiles]
+
+                        if cancer_prob is not None:
+                            cancer_prob = cancer_prob.to(args.device, non_blocking=True)[:, valid_matching_tiles]
+                        
+                        if (args.cat_y and not args.create_y) or args.tile_slide_training:
+                            if tile_y is not None:
+                                tile_y = tile_y.to(args.device, non_blocking=True).squeeze(0)
+                            else:
+                                print(f"{batch['slide_id']} tile_y is None, skipping")
+                                continue    
+
+                        if args.cnn_on_y:
+                            tiles = tiles.to(args.device, non_blocking=True)
+                            # tiles = tiles[valid_matching_tiles]
+                        
+                        if args.add_virchow2_features:
+                            print(f'images.shape before adding virchow2 features = {images.shape}, virchow2_feats.shape = {virchow2_feats.shape}')
+                            virchow2_feats = virchow2_feats.to(args.device, non_blocking=True)
+                            virchow2_feats = virchow2_feats[valid_matching_tiles]
+                            virchow2_feats = virchow2_feats.view(-1, VIRCHOW2_FEATURE_DIM)
+                            images = torch.cat([images, virchow2_feats], dim=-1)
+                        
+                        if args.add_uni2_features:
+                            print(f'images.shape before adding uni2 features = {images.shape}, uni2_feats.shape = {uni2_feats.shape}')
+                            uni2_feats = uni2_feats.to(args.device, non_blocking=True)
+                            uni2_feats = uni2_feats[valid_matching_tiles]
+                            uni2_feats = uni2_feats.view(-1, UNI2_FEATURE_DIM)
+                            images = torch.cat([images, uni2_feats], dim=-1)
+                        
+                        if args.add_conch_features:
+                            print(f'images.shape before adding conch features = {images.shape}, conch_feats.shape = {conch_feats.shape}')
+                            conch_feats = conch_feats.to(args.device, non_blocking=True)
+                            conch_feats = conch_feats[valid_matching_tiles]
+                            conch_feats = conch_feats.view(-1, CONCH_FEATURE_DIM)
+                            images = torch.cat([images, conch_feats], dim=-1)
+
+                        if args.external_model_logits:
+                            external_tile_logits = external_tile_logits.to(args.device, non_blocking=True)
+                            external_tile_logits = external_tile_logits[valid_matching_tiles]
+                        
+                        images = images.view(1, -1, args.tile_input_dim)
+
+                        if args.y_and_tumor_from_map and not args.cnn_on_y:
+                            # only keep tile_y values that are not -1 and not 0
+                            valid_tile_y_indices = (tile_y != -1) & (tile_y != 0)
+                            images = images[valid_tile_y_indices]
+                            if images.size(0) == 0:
+                                print(f"{batch['slide_id']} has no valid tile_y indices, skipping")
+                                continue
+                            img_coords = img_coords[valid_tile_y_indices]
+                            if not args.cnn_on_y:
+                                tile_y = tile_y[valid_tile_y_indices].view(-1, 1)
+                            # if args.cnn_on_y:
+                            #     tiles = tiles[valid_tile_y_indices]
+                            
+                    else:
+                        print(f"{batch['slide_id']} matching_tiles is None, skipping")
+                        continue
                 
-            if args.survival:
-                censoreship = batch['censoreship']
+                elif args.all_he_tiles:
+                    no_loss = True
+                    if args.add_virchow2_features:
+                        print(f'images.shape before adding virchow2 features = {images.shape}, virchow2_feats.shape = {virchow2_feats.shape}')
+                        virchow2_feats = virchow2_feats.to(args.device, non_blocking=True)
+                        images = torch.cat([images, virchow2_feats], dim=-1)
+                    
+                    if args.add_uni2_features:
+                        print(f'images.shape before adding uni2 features = {images.shape}, uni2_feats.shape = {uni2_feats.shape}')
+                        uni2_feats = uni2_feats.to(args.device, non_blocking=True)
+                        images = torch.cat([images, uni2_feats], dim=-1)
+                    
+                    if args.add_conch_features:
+                        print(f'images.shape before adding conch features = {images.shape}, conch_feats.shape = {conch_feats.shape}')
+                        conch_feats = conch_feats.to(args.device, non_blocking=True)
+                        images = torch.cat([images, conch_feats], dim=-1)
+                    
+                    images = images.view(1, -1, args.tile_input_dim)
+
+                if args.survival:
+                    censoreship = batch['censoreship']
 
             with torch.cuda.amp.autocast(fp16_scaler is not None, dtype=torch.float16):
                 # ********** get the logits **********
                 if save_embed:
                     if args.cat_y: 
                         if args.train_on_y:
-                            images, img_coords = images.unsqueeze(0).transpose(0, 1), img_coords.unsqueeze(0).transpose(0, 1)
+                            images, img_coords = images.view(-1, 1, args.tile_input_dim), img_coords.view(-1, 1, 2)
                             print(f'images.shape = {images.shape}')
                             if images.shape[0] == 0:
                                 print(f"slide {batch['slide_id']} has no matching ihc images, skipping")
                                 continue
+                            
                             if not args.pred_y_baseline:
-                                logits, tile_logits = model(images, img_coords)
-                            else:
+                                if args.cnn_on_y:
+                                    tiles = tiles.view(-1, 3, args.tile_size, args.tile_size)
+                                    print(f'tiles.shape = {tiles.shape} before model call')
+                                    tile_logits = model(tiles)
+                                    print(f'tile_logits.shape = {tile_logits.shape} after model call')
+                                    logits = tile_logits.mean()
+                                else:
+                                    logits, tile_logits = model(images, img_coords)
+
+                                if args.run_inference:
+                                    save_pred_y_dir = os.path.join(os.sep, "SSDStorage", "Breast", "Carmel", "Her2", "gigapath_IHC", f"tile_y_pred_{args.mpp}", slide_id)
+                                    if not os.path.exists(save_pred_y_dir):
+                                        os.makedirs(save_pred_y_dir, exist_ok=True)
+                                    file_name = f"local_tile_y_pred_val{args.val_fold[-1]}.npy" if args.only_annotated else f"local_tile_y_pred_ad_val{args.val_fold[-1]}.npy"
+                                    if args.y_and_tumor_from_map:
+                                        file_name = file_name.replace('local_tile_y', 'regional_tile_y_from_map')
+                                    if args.add_virchow2_features:
+                                        file_name = file_name.replace('pred', 'pred_add_virchow2')
+                                        if args.add_uni2_features:
+                                            file_name = file_name.replace('virchow2', 'virchow2_uni2')
+                                            if args.add_conch_features:
+                                                file_name = file_name.replace('virchow2_uni2', 'virchow2_uni2_conch')
+                                    if args.task_config.get('setting', 'multi_class') == 'binary':
+                                        tile_logits = torch.softmax(tile_logits, dim=-1)[:, -1]
+                                        file_name = file_name.replace('tile_y', 'binary_tile_y')
+
+                                    np.save(os.path.join(save_pred_y_dir, file_name), tile_logits.cpu().detach().numpy())
+                                    print(f'Saved tile_y_pred for slide {slide_id} to {os.path.join(save_pred_y_dir, file_name)}')
+                            else:  # args.pred_y_baseline
                                 tile_logits, embed = model(images, img_coords, return_embed=True)
                                 embed = embed[0]  # Get the first tile's embedding
                                 logits = tile_logits[0]
+
+                                if args.run_inference:
+                                    save_pred_bl_y_dir = os.path.join(os.sep, "SSDStorage", "Breast", "Carmel", "Her2", "gigapath_IHC", f"tile_y_pred_{args.mpp}", slide_id)
+                                    if not os.path.exists(save_pred_bl_y_dir):
+                                        os.makedirs(save_pred_bl_y_dir, exist_ok=True)
+                                    file_name = f"local_tile_y_pred_bl_val{args.val_fold[-1]}.npy" if args.only_annotated else f"local_tile_y_pred_bl_ad_val{args.val_fold[-1]}.npy"
+                                    if args.y_and_tumor_from_map:
+                                        file_name = file_name.replace('tile_y', 'tile_y_from_map')
+                                    np.save(os.path.join(save_pred_bl_y_dir, file_name), tile_logits.cpu().detach().numpy())
+                                    print(f'Saved tile_y_bl for slide {slide_id} to {os.path.join(save_pred_bl_y_dir, file_name)}')
                         else:
                             matching_ihc_images = ihc_images.squeeze(0)[matching_tiles]
                             # to create y
@@ -1099,7 +1614,7 @@ def evaluate(loader, model, fp16_scaler, loss_fn, epoch, args, save_embed=False)
 
                                 logits = model(matching_ihc_images, img_coords)
                                 
-                                if args.create_y:
+                                if args.run_inference:
                                     print(f'y = {logits}')
                                     save_y_dir = os.path.join(os.sep, "SSDStorage", "Breast", "Carmel", "Her2", "gigapath_IHC", f"tile_y_{args.mpp}", slide_id)
                                     if not os.path.exists(save_y_dir):
@@ -1109,13 +1624,36 @@ def evaluate(loader, model, fp16_scaler, loss_fn, epoch, args, save_embed=False)
                                     print(f'Saved tile_y for slide {slide_id} to {os.path.join(save_y_dir, file_name)}')
                                     continue
 
-                    elif args.score_can_as_sb or args.score_can_as_bs or args.film:
-                        _, tile_logits = args.tile_model(images, img_coords)
+                    elif args.score_can_as_sb or args.score_can_as_bs or args.film or args.weighted_film:
                         cancer_prob = cancer_prob.to(args.device, non_blocking=True)
-                        if not args.film:
-                            logits = model(images, img_coords, tile_scores=tile_logits, tile_cancer_probs=cancer_prob, score_as_scale=args.score_can_as_sb)
+                        if args.tile_slide_model:
+                            images, img_coords = images.view(-1, 1, args.tile_input_dim), img_coords.view(-1, 1, 2)
+                            if args.use_tile_classifier:
+                                tile_logits = model(images, img_coords, predict_tile_logits=True, tile_classifier=True)
+                            else:
+                                tile_logits = model(images, img_coords, predict_tile_logits=True)
+                        elif args.load_tile_logits:
+                            tile_logits = tile_logits.to(args.device, non_blocking=True)
                         else:
-                            logits = model(images, img_coords, tile_scores=tile_logits, tile_cancer_probs=cancer_prob, film=args.film)
+                            images, img_coords = images.view(-1, 1, args.tile_input_dim), img_coords.view(-1, 1, 2)
+                            _, tile_logits = args.tile_model(images, img_coords)
+                        
+                        images = images[:,:, :args.input_dim]
+                        images, img_coords = images.view(1, -1, args.input_dim), img_coords.view(1, -1, 2)
+                        if args.weighted_film:
+                            logits = model(images, img_coords, tile_scores=tile_logits, tile_cancer_probs=cancer_prob, weighted_film=args.weighted_film)
+                        elif not args.film:
+                            logits = model(images, img_coords, tile_scores=tile_logits, tile_cancer_probs=cancer_prob, score_as_scale=args.score_can_as_sb)
+                        else: # film
+                            if args.const_tl:
+                                tile_logits = torch.full_like(tile_logits, 3)
+                            if args.const_cp:
+                                cancer_prob = torch.full_like(cancer_prob, 1)
+
+                            if args.external_model_logits:
+                                logits, embed = model(images, img_coords, tile_scores=tile_logits, tile_cancer_probs=cancer_prob, external_model_scores=external_tile_logits, film=args.film, return_embed=True)
+                            else:
+                                logits, embed = model(images, img_coords, tile_scores=tile_logits, tile_cancer_probs=cancer_prob, film=args.film, return_embed=True)
 
                     elif args.synth_ihc_train: # Delete
                         images = torch.cat([images, synth_ihc_images], dim=-1)
@@ -1130,20 +1668,48 @@ def evaluate(loader, model, fp16_scaler, loss_fn, epoch, args, save_embed=False)
                     elif isinstance(model, TileClassificationHead):
                         logits, tile_logits, embed = model(images, img_coords, return_embed=True)
                         embeds[batch_idx] = embed.cpu().numpy()
+                    elif args.window_training:
+                        window_logits = []
+                        for window in slide_windows:
+                            wndw_logits = model(window['imgs'], window['coords'])
+                            window_logits.append(wndw_logits)
+                        window_logits = torch.stack(window_logits).view(len_windows, -1)
+                    elif args.paired_training_mw:
+                        if args.paired_mw_w_cancer:
+                            logits, embed = model(images, img_coords, ihc_images, modality_weights=True, cancer_weights=True, tile_cancer_probs=cancer_prob, return_embed=True)
+                        elif args.paired_mw_cancer_scale:
+                            logits, embed = model(images, img_coords, ihc_images, modality_weights=True, cancer_scale=True, tile_cancer_probs=cancer_prob, return_embed=True)
+                        else:
+                            logits, embed = model(images, img_coords, ihc_images, modality_weights=True, return_embed=True)
+                        embeds[batch_idx] = embed.cpu().numpy()
+                    elif args.paired_training_mb:
+                        logits, embed = model(images, img_coords, ihc_images, ihc_coords, modality_bias=True, return_embed=True)
+                        embeds[batch_idx] = embed.cpu().numpy()
+                    elif args.paired_training_cat_h:
+                        logits, embed = model(images, img_coords, ihc_images, ihc_coords, concat_h=True, return_embed=True)
+                        embeds[batch_idx] = embed.cpu().numpy()
                     else:
                         logits, embed = model(images, img_coords, return_embed=True)
                         embeds[batch_idx] = embed.cpu().numpy()
                 else: # no save_embed
                     if args.cat_y: # Delete
                         if args.train_on_y:
-                            images, img_coords = images.unsqueeze(0).transpose(0, 1), img_coords.unsqueeze(0).transpose(0, 1)
+                            images, img_coords = images.view(-1, 1, args.tile_input_dim), img_coords.view(-1, 1, 2)
                             print(f'images.shape = {images.shape}')
                             if images.shape[0] == 0:
                                 print(f"slide {batch['slide_id']} has no matching ihc images, skipping")
                                 continue
-
+                            
                             if not args.pred_y_baseline:
-                                logits, tile_logits = model(images, img_coords)
+                                if args.cnn_on_y:
+                                    tiles = tiles.view(-1, 3, args.tile_size, args.tile_size)
+                                    print(f'tiles.shape = {tiles.shape} before model call')
+                                    tile_logits = model(tiles)
+                                    print(f'tile_logits.shape = {tile_logits.shape} after model call')
+                                    # in case of binary classification keep dimension
+                                    logits = tile_logits.mean(dim=0, keepdim=True) if args.task_config.get('setting', 'multi_class') == 'binary' else tile_logits.mean()
+                                else:
+                                    logits, tile_logits = model(images, img_coords)
                             else:
                                 tile_logits = model(images, img_coords)
                         else:
@@ -1158,7 +1724,7 @@ def evaluate(loader, model, fp16_scaler, loss_fn, epoch, args, save_embed=False)
 
                                 logits = model(matching_ihc_images, img_coords).unsqueeze(-1)
                                 
-                                if args.create_y:
+                                if args.run_inference:
                                     print(f'y = {logits}')
                                     save_y_dir = os.path.join(os.sep, "SSDStorage", "Breast", "Carmel", "Her2", "gigapath_IHC", f"tile_y_{args.mpp}_val{args.val_fold[-1]}", slide_id)
                                     if not os.path.exists(save_y_dir):
@@ -1168,13 +1734,35 @@ def evaluate(loader, model, fp16_scaler, loss_fn, epoch, args, save_embed=False)
                                     print(f'Saved tile_y for slide {slide_id} to {os.path.join(save_y_dir, file_name)}')
                                     continue
 
-                    elif args.score_can_as_sb or args.score_can_as_bs or args.film:
-                        _, tile_logits = args.tile_model(images, img_coords)
+                    elif args.score_can_as_sb or args.score_can_as_bs or args.film or args.weighted_film:
                         cancer_prob = cancer_prob.to(args.device, non_blocking=True)
-                        if not args.film:
+                        if args.tile_slide_model:
+                            images, img_coords = images.view(-1, 1, args.tile_input_dim), img_coords.view(-1, 1, 2)
+                            if args.use_tile_classifier:
+                                tile_logits = model(images, img_coords, predict_tile_logits=True, tile_classifier=True)
+                            else:
+                                tile_logits = model(images, img_coords, predict_tile_logits=True)
+                        elif args.load_tile_logits:
+                            tile_logits = tile_logits.to(args.device, non_blocking=True)
+                        else:
+                            _, tile_logits = args.tile_model(images, img_coords)                        
+
+                        images = images[:,:, :args.input_dim]
+                        images, img_coords = images.view(1, -1, args.input_dim), img_coords.view(1, -1, 2)
+                        if args.weighted_film:
+                            logits = model(images, img_coords, tile_scores=tile_logits, tile_cancer_probs=cancer_prob, weighted_film=args.weighted_film)
+                        elif not args.film:
                             logits = model(images, img_coords, tile_scores=tile_logits, tile_cancer_probs=cancer_prob, score_as_scale=args.score_can_as_sb)
                         else:
-                            logits = model(images, img_coords, tile_scores=tile_logits, tile_cancer_probs=cancer_prob, film=args.film)
+                            if args.const_tl:
+                                tile_logits = torch.full_like(tile_logits, 3)
+                            if args.const_cp:
+                                cancer_prob = torch.full_like(cancer_prob, 1)
+                            
+                            if args.external_model_logits:
+                                logits = model(images, img_coords, tile_scores=tile_logits, tile_cancer_probs=cancer_prob, external_model_scores=external_tile_logits, film=args.film)
+                            else:
+                                logits = model(images, img_coords, tile_scores=tile_logits, tile_cancer_probs=cancer_prob, film=args.film)
 
                     elif args.synth_ihc_train: # Delete
                         images = torch.cat([images, synth_ihc_images], dim=-1)
@@ -1184,6 +1772,24 @@ def evaluate(loader, model, fp16_scaler, loss_fn, epoch, args, save_embed=False)
                         local_tumor_labels = local_tumor_labels.squeeze(0).long()
                         print(f'images.shape = {images.shape}, local_tumor_labels.shape = {local_tumor_labels.shape}')
                         logits = model(images, img_coords)
+                    elif args.window_training:
+                        window_logits = []
+                        for window in slide_windows:
+                            wndw_logits = model(window['imgs'], window['coords'])
+                            window_logits.append(wndw_logits)
+                        window_logits = torch.stack(window_logits).view(len_windows, -1)
+                        logits = window_logits.mean(dim=0) # for evaluation records
+                    elif args.paired_training_mw:
+                        if args.paired_mw_w_cancer:
+                            logits = model(images, img_coords, ihc_images, modality_weights=True, cancer_weights=True, tile_cancer_probs=cancer_prob)
+                        elif args.paired_mw_cancer_scale:
+                            logits = model(images, img_coords, ihc_images, modality_weights=True, cancer_scale=True, tile_cancer_probs=cancer_prob)
+                        else:
+                            logits = model(images, img_coords, ihc_images, modality_weights=True)
+                    elif args.paired_training_mb:
+                        logits = model(images, img_coords, ihc_images, ihc_coords, modality_bias=True)
+                    elif args.paired_training_cat_h:
+                        logits = model(images, img_coords, ihc_images, ihc_coords, concat_h=True)
                     else:
                         logits = model(images, img_coords)
                         
@@ -1191,14 +1797,15 @@ def evaluate(loader, model, fp16_scaler, loss_fn, epoch, args, save_embed=False)
                     continue
                 
                 # ********** Shapes and types before loss **********
-                if isinstance(loss_fn, torch.nn.BCEWithLogitsLoss):
-                    label = label.squeeze(-1).float()
-                elif task_setting == 'continuous' and not args.loss_fn == 'cox':
-                    label = label.squeeze(-1).float()
-                    logits = logits.squeeze(-1)
+                if not args.window_training:
+                    if isinstance(loss_fn, torch.nn.BCEWithLogitsLoss):
+                        label = label.squeeze(-1).float()
+                    elif task_setting == 'continuous' and not args.loss_fn == 'cox':
+                        label = label.squeeze(-1).float()
+                        logits = logits.squeeze(-1)
 
-                else:
-                    label = label.squeeze(-1).long()
+                    else:
+                        label = label.squeeze(-1).long()
                 
                 # ********** loss computation **********
                 if not no_loss:
@@ -1207,16 +1814,31 @@ def evaluate(loader, model, fp16_scaler, loss_fn, epoch, args, save_embed=False)
                             if not args.survival:
                                 print(f'logits = {logits}, label = {label}') # Delete
                                 if args.train_on_y:
-                                    # pred_class = logits.argmax()
-                                    # loss = loss_fn(pred_class, label)
                                     if args.task_config.get('setting', 'multi_class') == 'binary':
                                         print(f"tile_y = {tile_y}")
                                         tile_y = (tile_y >= 2).long().squeeze(-1)
+
+                                    elif not tile_logits.shape == tile_y.shape:
+                                        tile_logits = tile_logits.view(-1)
+                                        tile_y = tile_y.view(-1)
+                                    # pred_class = logits.argmax()
+                                    # loss = loss_fn(pred_class, label)
+                                    
                                     loss = loss_fn(tile_logits, tile_y)
                                     print(f"loss = {loss}")
                                     print(f"tile_y = {tile_y}, tile_logits = {tile_logits}, logits = {logits}, label = {label}")
                                 elif args.predict_cancer:
                                     loss = loss_fn(logits, local_tumor_labels)
+                                elif args.window_training:
+                                    window_labels = torch.stack([wndw['window_y'] for wndw in slide_windows])
+                                    print(f"window_logits = {window_logits}, window_labels = {window_labels}")
+                                    loss = loss_fn(window_logits, window_labels)
+                                    print(f"loss = {loss}")
+                                elif args.tile_slide_training:
+                                    tile_loss = loss_fn(tile_logits.view(-1), tile_y.view(-1))
+                                    slide_loss = loss_fn(logits, label)
+                                    loss = tile_loss + slide_loss
+                                    print(f"tile_loss = {tile_loss}, slide_loss = {slide_loss}, loss = {loss}")
                                 else:
                                     loss = loss_fn(logits, label)
                             else:
@@ -1273,27 +1895,31 @@ def evaluate(loader, model, fp16_scaler, loss_fn, epoch, args, save_embed=False)
                 records['prob'][batch_idx] = Y_prob.cpu().numpy()
                 records['label'][batch_idx] = label.cpu().numpy()
             elif task_setting == 'multi_class' or task_setting == 'binary':
-                Y_prob = torch.softmax(logits, dim=-1).cpu() # .view(1, -1)
+                Y_prob = torch.softmax(logits, dim=-1).cpu()
                 print(f"Y_prob = {Y_prob}, shape = {Y_prob.shape}")
-                if not args.predict_cancer:
+                if not (args.predict_cancer or args.pred_y):
                     # convert label to one-hot
-                    label_ = torch.zeros_like(Y_prob).scatter_(1, label.cpu().unsqueeze(1), 1)
                     records['prob'][batch_idx] = Y_prob.numpy() # if args.n_classes == 1 else np.argmax(Y_prob.numpy())
+                    try:
+                        label_ = torch.zeros_like(Y_prob).scatter_(-1, label.cpu().unsqueeze(1), 1)
+                    except BaseException as e:
+                        label_ = torch.zeros_like(Y_prob)
+                        label_[label.item()] = 1
                     records['label'][batch_idx] = label_.numpy()
                 else:
-                    if tumor_indices is not None:
+                    if tumor_indices is not None and args.predict_cancer:
                         print(f"local_tumor_labels.shape = {local_tumor_labels.shape}, y_prob.shape = {Y_prob.shape}")
                         # convert label to one-hot
                         label_ = torch.zeros_like(Y_prob).scatter_(1, local_tumor_labels.cpu().unsqueeze(1), 1)
                         records['prob'].append(Y_prob.numpy())
                         records['label'].append(label_.numpy())
                     else:
-                        print(f"label.shape = {local_tumor_labels.shape}, y_prob.shape = {Y_prob.shape}")
+                        # print(f"label.shape = {local_tumor_labels.shape}, y_prob.shape = {Y_prob.shape}")
                         label_ = torch.zeros_like(Y_prob).scatter_(1, label.cpu().unsqueeze(1), 1)
                         records['prob'].append(Y_prob.numpy())
                         records['label'].append(label_.numpy())
 
-                    if args.run_inference:
+                    if args.run_inference and args.predict_cancer:
                         y_prob_to_save = Y_prob[:, 1].numpy()
                         save_prob_dir = os.path.join(args.root_path.replace("gigapath_features", "cancer_probs"), slide_id)
                         if not os.path.exists(save_prob_dir):
@@ -1307,8 +1933,21 @@ def evaluate(loader, model, fp16_scaler, loss_fn, epoch, args, save_embed=False)
                     #     records['prob'][batch_idx] = ((logits * model.std.item()) + model.mean.item()).cpu().numpy()
                     #     records['label'][batch_idx] = ((label * model.std.item()) + model.mean.item()).cpu().numpy()
                     if args.pred_y_baseline or args.pred_y:
-                        records['prob'].append(tile_logits.cpu().numpy())
-                        records['label'].append(tile_y.cpu().numpy())
+                        if args.all_he_tiles:
+                            tile_y, tile_logits = tile_y.view(-1), tile_logits.view(-1)
+                            valid_matching_tiles = ((~torch.isnan(matching_tiles)) & (matching_tiles < ihc_images.shape[1])).view(-1)
+                            # get the indices of true values in valid_matching_tiles
+                            valid_matching_indices = torch.nonzero(valid_matching_tiles).view(-1)
+
+                            tumor_in_non_nan = np.isin(valid_matching_indices, tumor_indices)
+                            tumor_matching_indices = np.where(tumor_in_non_nan)[0]
+                            tile_y = tile_y[tumor_matching_indices]
+
+                            tile_logits = tile_logits[valid_matching_tiles]
+                            tile_logits = tile_logits[tumor_matching_indices]
+
+                        records['prob'].append(tile_logits.view(-1, 1).cpu().numpy())
+                        records['label'].append(tile_y.view(-1, 1).cpu().numpy())
                     elif args.train_on_y:
                         pred_class = logits.argmax()
                         records['prob'][batch_idx] = pred_class.cpu().numpy()
@@ -1331,7 +1970,9 @@ def evaluate(loader, model, fp16_scaler, loss_fn, epoch, args, save_embed=False)
                                             print(f"Only one tumor tile for slide {slide_id}, cannot compute {key}")
                                             continue
                                         rho, _ = regression_losses[key](np_tile_logits, np_tile_y)
-                                        records[key] += rho
+                                        if not np.isnan(rho):
+                                            records[key] += rho
+                                            print(f"Computed {key} for slide {slide_id}: {rho}")
                                     else:
                                         records[key] += regression_losses[key](tile_logits, tile_y).item()
                                 else:
@@ -1345,9 +1986,10 @@ def evaluate(loader, model, fp16_scaler, loss_fn, epoch, args, save_embed=False)
                     records['censoreship'][batch_idx] = censoreship[0].cpu().numpy()
 
         ### end of for batch loop ###
-        if args.predict_cancer or args.pred_y_baseline or args.pred_y:
-            records['prob'] = np.concatenate(records['prob'], axis=0)
-            records['label'] = np.concatenate(records['label'], axis=0)
+        if (args.predict_cancer or args.pred_y_baseline or args.pred_y or (args.train_on_y and not task_setting == 'binary')) and not args.cnn_on_y:
+            records['prob'] = np.concatenate(records['prob'])
+            records['label'] = np.concatenate(records['label'])
+
     if not no_loss:
         records['loss'] = records['loss'] / len(loader)
         if task_setting == 'continuous' and not args.survival:
@@ -1355,8 +1997,9 @@ def evaluate(loader, model, fp16_scaler, loss_fn, epoch, args, save_embed=False)
                 records[key] = records[key] / len(loader)
     else:
         records['loss'] = 0
-        for key in regression_losses:
-            records[key] = 0
+        if task_setting == 'continuous':
+            for key in regression_losses:
+                records[key] = 0
     try:
         if not task_setting == 'continuous':
             records.update(calculate_metrics_with_task_cfg(records['prob'], records['label'], args.task_config))
@@ -1382,8 +2025,9 @@ def evaluate(loader, model, fp16_scaler, loss_fn, epoch, args, save_embed=False)
                     tile_y_bin = (records['label'] >= 2).astype(int)
                     # create a DataFrame to hold the values and save it to csv
                     df = pd.DataFrame({'tile_y': records['label'].flatten(), 'tile_y_bin': tile_y_bin.flatten(), 'tile_pred': records['prob'].flatten()})
-                    df.to_csv(os.path.join(args.save_dir, f"tile_y_preds_{args.mpp}_val{args.val_fold[0]}.csv"), index=False)
-                    print(f'Saved tile_y predictions to {os.path.join(args.save_dir, f"tile_y_preds_{args.mpp}_val{args.val_fold[0]}.csv")}')
+                    df.to_csv(os.path.join(args.save_dir, f"tumor_tile_valid_y_preds_{args.mpp}_val{args.val_fold[0]}.csv"), index=False)
+                    
+                    print(f'Saved tile_y predictions to {os.path.join(args.save_dir, f"tumor_tile_valid_y_preds_{args.mpp}_val{args.val_fold[0]}.csv")}')
 
                     print(f"tile_y_bin = {tile_y_bin}, records['label'] = {records['label']}")
                     records.update(calculate_metrics_with_task_cfg(records['prob'], tile_y_bin, {'name': 'binary_y', 'setting': 'binary', 'label_dict': {0: 0, 1: 1}}))

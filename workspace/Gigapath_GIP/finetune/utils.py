@@ -50,6 +50,14 @@ def load_obj(name):
         return pickle.load(f)
 
 
+def load_npy_file(file_path):
+    try:
+        npy = np.load(file_path) # load the numpy file
+        return npy
+    except BaseException as e:
+        print(e)
+
+
 def seed_torch(device, seed=7):
     # ------------------------------------------------------------------------------------------
     # References:
@@ -128,43 +136,61 @@ def pad_tensors(imgs, coords):
 def slide_collate_fn(samples):
     '''Separate the inputs and targets into separate lists
     Return value {imgs: [N, L, 256, 384], pad_mask: [N, L]}'''
-    image_list = [s['imgs'] for s in samples]
-    ihc_image_list = [s['ihc_imgs'] for s in samples]
-    synth_ihc_image_list = [s['synth_ihc_imgs'] for s in samples]
-    img_len_list = [s['imgs'].size(0) for s in samples]
-    coord_list = [s['coords'] for s in samples]
-    ihc_coord_list = [s['ihc_coords'] for s in samples]
-    label_list = [s['labels'] for s in samples]
-    matching_tiles_list = [s['matching_tiles'] for s in samples]
-    tumor_indices_list = [s['tumor_indices'] for s in samples]
-    non_tumor_indices_list = [s['non_tumor_indices'] for s in samples]
-    cancer_prob_list = [s['cancer_prob'] for s in samples]
-    tiles_list = [s['tiles'] for s in samples]
-    ihc_tiles_list = [s['ihc_tiles'] for s in samples]
-    tile_y_list = [s['tile_y'] for s in samples]
-    slide_id_list = [s['slide_id'] for s in samples]
+    image_list = [s.get('imgs', None) for s in samples]
+    ihc_image_list = [s.get('ihc_imgs', None) for s in samples]
+    synth_ihc_image_list = [s.get('synth_ihc_imgs', None) for s in samples]
+    img_len_list = [s.get('imgs', None).size(0) if s.get('imgs', None) is not None else 0 for s in samples]
+    coord_list = [s.get('coords', None) for s in samples]
+    ihc_coord_list = [s.get('ihc_coords', None) for s in samples]
+    label_list = [s.get('labels', None) for s in samples]
+    matching_tiles_list = [s.get('matching_tiles', None) for s in samples]
+    tumor_indices_list = [s.get('tumor_indices', None) for s in samples]
+    non_tumor_indices_list = [s.get('non_tumor_indices', None) for s in samples]
+    cancer_prob_list = [s.get('cancer_prob', None) for s in samples]
+    tile_logits_list = [s.get('tile_logits', None) for s in samples]
+    external_tile_logits_list = [s.get('external_tile_logits', None) for s in samples]
+    # tiles_list = [s.get('tiles', None) for s in samples]
+    ihc_tiles_list = [s.get('ihc_tiles', None) for s in samples]
+    tile_y_list = [s.get('tile_y', None) for s in samples]
+    virchow2_feats_list = [s.get('virchow2_feats', None) for s in samples]
+    uni2_feats_list = [s.get('uni2_feats', None) for s in samples]
+    conch_feats_list = [s.get('conch_feats', None) for s in samples]
+    clinical_feats_list = [s.get('clinical_feats', None) for s in samples]
+    score_list = [s.get('score', None) for s in samples]
+    slide_id_list = [s.get('slide_id', None) for s in samples]
     labels = torch.stack(label_list)
     matching_tiles = torch.stack(matching_tiles_list) if matching_tiles_list[0] is not None else None
     tumor_indices = torch.stack(tumor_indices_list) if tumor_indices_list[0] is not None else None
     non_tumor_indices = torch.stack(non_tumor_indices_list) if non_tumor_indices_list[0] is not None else None
     cancer_prob = torch.stack(cancer_prob_list) if cancer_prob_list[0] is not None else None
-    tiles = torch.stack(tiles_list) if tiles_list[0] is not None else None
+    tile_logits = torch.stack(tile_logits_list) if tile_logits_list[0] is not None else None
+    external_tile_logits = torch.stack(external_tile_logits_list) if external_tile_logits_list[0] is not None else None
+    virchow2_feats = torch.stack(virchow2_feats_list) if virchow2_feats_list[0] is not None else None
+    uni2_feats = torch.stack(uni2_feats_list) if uni2_feats_list[0] is not None else None
+    conch_feats = torch.stack(conch_feats_list) if conch_feats_list[0] is not None else None
+    clinical_feats = torch.stack(clinical_feats_list) if clinical_feats_list[0] is not None else None
+    score = torch.stack(score_list) if score_list[0] is not None else None
+    # tiles = torch.stack(tiles_list) if tiles_list[0] is not None else None
+    tiles = samples[0]['tiles'] if samples[0].get('tiles', None) is not None else None
     ihc_tiles = torch.stack(ihc_tiles_list) if ihc_tiles_list[0] is not None else None
     tile_y = torch.stack(tile_y_list) if tile_y_list[0] is not None else None
-    censoreship = [s['censoreship'] for s in samples]
-    pad_imgs, pad_coords, pad_mask = pad_tensors(image_list, coord_list)
-    
-    res_tuple = pad_tensors(ihc_image_list, ihc_coord_list) if ihc_image_list[0] is not None else None, None, None
-    res_tuple = res_tuple[0]
-    if res_tuple is not None:
-        ihc_pad_imgs, ihc_pad_coords, ihc_pad_mask = res_tuple[0], res_tuple[1], res_tuple[2]
-    else:
-        ihc_pad_imgs, ihc_pad_coords, ihc_pad_mask = None, None, None
+    censoreship = [s.get('censoreship', None) for s in samples]
+    if image_list[0] is not None:
+        pad_imgs, pad_coords, pad_mask = pad_tensors(image_list, coord_list)
+        
+        res_tuple = pad_tensors(ihc_image_list, ihc_coord_list) if ihc_image_list[0] is not None else None, None, None
+        res_tuple = res_tuple[0]
+        if res_tuple is not None:
+            ihc_pad_imgs, ihc_pad_coords, ihc_pad_mask = res_tuple[0], res_tuple[1], res_tuple[2]
+        else:
+            ihc_pad_imgs, ihc_pad_coords, ihc_pad_mask = None, None, None
 
-    if synth_ihc_image_list[0] is not None:
-        synth_pad_imgs, _, _ = pad_tensors(synth_ihc_image_list, coord_list)
+        if synth_ihc_image_list[0] is not None:
+            synth_pad_imgs, _, _ = pad_tensors(synth_ihc_image_list, coord_list)
+        else:
+            synth_pad_imgs = None
     else:
-        synth_pad_imgs = None
+        pad_imgs, pad_coords, pad_mask, ihc_pad_imgs, ihc_pad_coords, ihc_pad_mask, synth_pad_imgs = None, None, None, None, None, None, None
     
     data_dict = {'imgs': pad_imgs, 
             'ihc_imgs': ihc_pad_imgs,
@@ -180,6 +206,13 @@ def slide_collate_fn(samples):
             'tumor_indices': tumor_indices,
             'non_tumor_indices': non_tumor_indices,
             'cancer_prob': cancer_prob,
+            'tile_logits': tile_logits,
+            'external_tile_logits': external_tile_logits,
+            'virchow2_feats': virchow2_feats,
+            'uni2_feats': uni2_feats,
+            'conch_feats': conch_feats,
+            'clinical_feats': clinical_feats,
+            'score': score,
             'tiles': tiles,
             'ihc_tiles': ihc_tiles,
             'tile_y': tile_y,
@@ -201,6 +234,27 @@ def slide_collate_fn_for_heatmap(samples):
             'coords': pad_coords,
             'pad_mask': pad_mask,
             'labels': labels}
+    return data_dict
+
+
+def slide_collate_fn_for_window(samples):
+    '''Separate the inputs and targets into separate lists
+    Return value {imgs: [N, L, 256, 384], pad_mask: [N, L]}'''
+    image_list = [s['imgs'] for s in samples]
+    img_len_list = [s['imgs'].size(0) for s in samples]
+    coord_list = [s['coords'] for s in samples]
+    label_list = [s['labels'] for s in samples]
+    window_y_list = [s['window_y'] for s in samples]
+    labels = torch.stack(label_list)
+    window_y = torch.stack(window_y_list)
+    pad_imgs, pad_coords, pad_mask = pad_tensors(image_list, coord_list)
+    
+    data_dict = {'imgs': pad_imgs, 
+            'img_lens': img_len_list,
+            'coords': pad_coords,
+            'pad_mask': pad_mask,
+            'labels': labels,
+            'window_y': window_y}
     return data_dict
 
 
@@ -294,9 +348,11 @@ def get_loader(train_data, val_data, test_data,
 
     return train_loader, val_loader, test_loader
 
-def get_test_loader(test_data, num_workers=10, for_heatmap = False, **kwargs):
+def get_test_loader(test_data, num_workers=10, for_heatmap = False, for_window = False, **kwargs):
     if for_heatmap:
         collate_fn = slide_collate_fn_for_heatmap
+    elif for_window:
+        collate_fn = slide_collate_fn_for_window
     else:
         collate_fn = slide_collate_fn
     def seed_worker(worker_id):
@@ -975,11 +1031,10 @@ def parse_tile_name(tile_name):
     else:
         raise ValueError(f"Invalid tile_name format: {tile_name}")
 
-def correct_coords(x_y_coords: np.array):
+def correct_coords(x_y_coords: np.array, desired_mpp: float):
     rounded_mpp = round_mpp(SLIDE_MPP)
     mpp_correction_factor = SLIDE_MPP / rounded_mpp
-    # x_y_coords = tuple(map(lambda x: x * (mpp_correction_factor * DESIRED_MPP) / SLIDE_MPP, x_y_coords))
-    x_y_coords = x_y_coords * (mpp_correction_factor * DESIRED_MPP) / SLIDE_MPP
+    x_y_coords = x_y_coords * (mpp_correction_factor * desired_mpp) / SLIDE_MPP
     return x_y_coords
 
 def slide_to_thumb_coord(x_y_slide_coords: np.array, slide_dimensions, thumb_size):

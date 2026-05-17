@@ -3,6 +3,7 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 from . import slide_encoder
+from torchvision import models
 
 
 class ClassificationHead(nn.Module):
@@ -127,12 +128,14 @@ class ModulatedClassificationHead(nn.Module):
     def __init__(
         self,
         input_dim,
+        tile_input_dim,
         latent_dim,
         feat_layer,
         n_classes=2,
         model_arch="gigapath_slide_enc12l768d",
         pretrained="hf_hub:prov-gigapath/prov-gigapath",
         freeze=False,
+        external_model_logits=False,
         **kwargs,
     ):
         super(ModulatedClassificationHead, self).__init__()
@@ -140,6 +143,7 @@ class ModulatedClassificationHead(nn.Module):
         # setup the slide encoder
         self.feat_layer = [eval(x) for x in feat_layer.split("-")]
         self.feat_dim = len(self.feat_layer) * latent_dim
+        self.external_model_logits = external_model_logits
         if self.feat_dim != 768:
             model_arch = f"gigapath_slide_enc12l{self.feat_dim}d"
         self.slide_encoder = slide_encoder.create_model(pretrained, model_arch, in_chans=input_dim, **kwargs)
@@ -152,12 +156,23 @@ class ModulatedClassificationHead(nn.Module):
             print("Done")
         # setup the classifier
         self.classifier = nn.Sequential(*[nn.Linear(self.feat_dim, n_classes)])
+        self.tile_classifier = nn.Sequential(
+            nn.Linear(tile_input_dim, tile_input_dim // 2), 
+            nn.GELU(),
+            nn.Linear(tile_input_dim // 2, tile_input_dim // 4), 
+            nn.GELU(),
+            nn.Linear(tile_input_dim // 4, n_classes), 
+        )
         # FiLM layer
-        self.FiLM = nn.Linear(2, input_dim * 2) # tile logit and cancer prob as bias and scale
+        if not external_model_logits:
+            self.FiLM = nn.Linear(2, input_dim * 2) # tile logit and cancer prob as bias and scale
+        else:
+            self.FiLM = nn.Linear(3, input_dim * 2) # tile logit and cancer prob as bias and scale
 
 
     def forward(self, images: torch.Tensor, coords: torch.Tensor, tile_scores: torch.Tensor = None, tile_cancer_probs: torch.Tensor = None, score_as_scale: bool = True, 
-                film: bool = False, return_embed: bool = False) -> torch.Tensor:
+                film: bool = False, weighted_film: bool = False, external_model_scores: torch.Tensor = None, predict_tile_logits: bool = False,
+                tile_classifier: bool = False, return_embed: bool = False) -> torch.Tensor:
         """
         Arguments:
         ----------
@@ -171,17 +186,35 @@ class ModulatedClassificationHead(nn.Module):
             images = images.unsqueeze(0)
         assert len(images.shape) == 3
 
-        print(f"tile_scores.shape = {tile_scores.shape}, tile_cancer_probs.shape = {tile_cancer_probs.shape}")
+        if not predict_tile_logits:
+            if weighted_film:
+                cond = torch.cat([(tile_scores / 3).view(-1, 1), tile_cancer_probs.view(-1, 1)], dim=-1)  # [N, 2]
+                print(f'cond.shape = {cond.shape}')
+                features, weights = self.FiLM(cond).chunk(2, dim=-1)    # each [N, 1536]
+                weights = torch.sigmoid(weights)  # Convert to [0, 1]
+                images = (1 - weights) * images + weights * features.view(1, images.shape[1], -1)  # Apply weights to images
+            else:
+                if not film:
+                    scale = tile_scores / 3 if score_as_scale else tile_cancer_probs
+                    bias = tile_cancer_probs if score_as_scale else (tile_scores / 3)
+                    scale = scale.view(1, images.shape[1], -1)
+                    bias = bias.view(1, images.shape[1], -1)
+                else:
+                    if not self.external_model_logits:
+                        cond = torch.cat([(tile_scores / 3).view(-1, 1), tile_cancer_probs.view(-1, 1)], dim=-1)  # [N, 2]
+                        # cond = torch.cat([(tile_scores).view(-1, 1), tile_cancer_probs.view(-1, 1)], dim=-1)  # [N, 2]
+                        print(f'cond.shape = {cond.shape}')
+                        scale, bias = self.FiLM(cond).chunk(2, dim=-1)    # each [N, 1536]
+                    else:  # external model logits are also included in the FiLM input
+                        cond = torch.cat([(tile_scores / 3).view(-1, 1), tile_cancer_probs.view(-1, 1), external_model_scores.view(-1, 1)], dim=-1)  # [N, 3]
+                        print(f'cond.shape = {cond.shape}')
+                        scale, bias = self.FiLM(cond).chunk(2, dim=-1)    # each [N, 1536]
 
-        if not film:
-            scale = tile_scores / 3 if score_as_scale else tile_cancer_probs
-            scale = scale.unsqueeze(-1)
-            bias = tile_cancer_probs.unsqueeze(-1) if score_as_scale else (tile_scores / 3).unsqueeze(-1)
-        else:
-            cond = torch.cat([(tile_scores / 3).view(-1, 1), tile_cancer_probs.view(-1, 1)], dim=-1)  # [N, 2]
-            print(f'cond.shape = {cond.shape}')
-            scale, bias = self.FiLM(cond).chunk(2, dim=-1)    # each [N, 1536]
-        images = images * scale + bias  # Apply scaling and bias to images
+                print(f"images.shape = {images.shape}, tile_scores.shape = {tile_scores.shape}, tile_cancer_probs.shape = {tile_cancer_probs.shape}")
+                images = images * scale + bias  # Apply scaling and bias to images
+        elif tile_classifier:
+            tile_logits = self.tile_classifier(images)
+            return tile_logits
         
         # forward GigaPath slide encoder
         img_enc = self.slide_encoder.forward(images, coords, all_layer_embed=True)
@@ -190,6 +223,138 @@ class ModulatedClassificationHead(nn.Module):
         # classifier
         h = img_enc.reshape([-1, img_enc.size(-1)])
         logits = self.classifier(h)
+        if return_embed:
+            return logits, h
+        else:
+            return logits
+
+
+class PairedClassificationHead(nn.Module):
+    """
+    The classification head for the slide encoder
+
+    Arguments:
+    ----------
+    input_dim: int
+        The input dimension of the slide encoder
+    latent_dim: int
+        The latent dimension of the slide encoder
+    feat_layer: str
+        The layers from which embeddings are fed to the classifier, e.g., 5-11 for taking out the 5th and 11th layers
+    n_classes: int
+        The number of classes
+    model_arch: str
+        The architecture of the slide encoder
+    pretrained: str
+        The path to the pretrained slide encoder
+    freeze: bool
+        Whether to freeze the pretrained model
+    """
+
+    def __init__(
+        self,
+        input_dim,
+        latent_dim,
+        feat_layer,
+        n_classes=2,
+        model_arch="gigapath_slide_enc12l768d",
+        pretrained="hf_hub:prov-gigapath/prov-gigapath",
+        freeze=False,
+        **kwargs,
+    ):
+        super(PairedClassificationHead, self).__init__()
+
+        # setup the slide encoder
+        self.feat_layer = [eval(x) for x in feat_layer.split("-")]
+        self.feat_dim = len(self.feat_layer) * latent_dim
+        if self.feat_dim != 768:
+            model_arch = f"gigapath_slide_enc12l{self.feat_dim}d"
+        self.slide_encoder = slide_encoder.create_model(pretrained, model_arch, in_chans=input_dim, **kwargs)
+        self.ihc_slide_encoder = slide_encoder.create_model(pretrained, model_arch, in_chans=input_dim, **kwargs)
+
+        # whether to freeze the pretrained model
+        if freeze:
+            print("Freezing Pretrained GigaPath model")
+            for name, param in self.slide_encoder.named_parameters():
+                param.requires_grad = False
+            for name, param in self.ihc_slide_encoder.named_parameters():
+                param.requires_grad = False
+            print("Done")
+
+        # Learnable vectors to distinguish H&E from IHC
+        self.he_type_embed = nn.Parameter(torch.zeros(1, 1, input_dim))
+        self.ihc_type_embed = nn.Parameter(torch.zeros(1, 1, input_dim))
+        
+        # Initialize with small random values
+        nn.init.normal_(self.he_type_embed, std=0.02)
+        nn.init.normal_(self.ihc_type_embed, std=0.02)
+
+        # setup the classifier
+        self.classifier = nn.Sequential(*[nn.Linear(self.feat_dim, n_classes)])
+        self.double_classifier = nn.Sequential(*[nn.Linear(self.feat_dim * 2, n_classes)])
+        # FiLM layer
+        self.FiLM = nn.Linear(input_dim * 2, input_dim) # H&E weight vs IHC weight
+        self.cancer_FiLM = nn.Linear(1, input_dim * 2)
+
+
+    def forward(self, images: torch.Tensor, coords: torch.Tensor, ihc_images: torch.Tensor = None, ihc_coords: torch.Tensor = None, tile_cancer_probs: torch.Tensor = None, 
+                return_embed: bool = False, modality_weights: bool = False, modality_bias: bool = False, concat_h: bool = False, cancer_weights: bool = False,
+                cancer_scale: bool = False) -> torch.Tensor:
+        """
+        Arguments:
+        ----------
+        images: torch.Tensor
+            The input images with shape [N, L, D]
+        coords: torch.Tensor
+            The input coordinates with shape [N, L, 2]
+        """
+        # inputs: [N, L, D]
+        if len(images.shape) == 2:
+            images = images.unsqueeze(0)
+        assert len(images.shape) == 3
+
+        if modality_weights:
+            cond = torch.cat([images, ihc_images], dim=-1)  # [N, L, 2 * D]
+            print(f'cond.shape = {cond.shape}')
+            he_weights = self.FiLM(cond)  # each [N, 1536]
+            he_weights = torch.sigmoid(he_weights)  # Convert to [0, 1]
+
+            print(f"he_weights.shape = {he_weights.shape}")
+            images = images * he_weights + (1 - he_weights) * ihc_images  # Apply weights to images
+
+            if cancer_weights:
+                cancer_cond = tile_cancer_probs.view(-1, 1)  # [N, 1]
+                scale, bias = self.cancer_FiLM(cancer_cond).chunk(2, dim=-1)    # each [N, 1536]
+                images = images * scale.view(1, images.shape[1], -1) + bias.view(1, images.shape[1], -1)  # Apply scaling and bias to images
+            elif cancer_scale:
+                images = images * tile_cancer_probs.view(1, -1, 1)  # Scale images by cancer probabilities
+        elif modality_bias:
+            # 1. Add Modality Embeddings (Broadcasting handles the batch/sequence dims)
+            images = images + self.he_type_embed
+            ihc_images = ihc_images + self.ihc_type_embed
+            
+            # 2. Concatenate along the 'num_tiles' dimension (dim=1)
+            # Resulting shape: (batch_size, num_tiles_he + num_tiles_ihc, feat_dim)
+            images = torch.cat([images, ihc_images], dim=-2)
+            coords = torch.cat([coords, ihc_coords], dim=-2)
+        
+        # forward GigaPath slide encoder
+        img_enc = self.slide_encoder.forward(images, coords, all_layer_embed=True)
+        img_enc = [img_enc[i] for i in self.feat_layer]
+        img_enc = torch.cat(img_enc, dim=-1)
+        # classifier
+        h = img_enc.reshape([-1, img_enc.size(-1)])
+
+        if concat_h:
+            ihc_img_enc = self.ihc_slide_encoder.forward(ihc_images, ihc_coords, all_layer_embed=True)
+            ihc_img_enc = [ihc_img_enc[i] for i in self.feat_layer]
+            ihc_img_enc = torch.cat(ihc_img_enc, dim=-1)
+            ihc_h = ihc_img_enc.reshape([-1, ihc_img_enc.size(-1)])
+            h = torch.cat([h, ihc_h], dim=-1)
+            logits = self.double_classifier(h)
+        else:
+            logits = self.classifier(h)
+
         if return_embed:
             return logits, h
         else:
@@ -218,6 +383,7 @@ class TileClassificationHead(nn.Module):
         latent_dim,
         feat_layer,
         input_dim,
+        tile_input_dim,
         n_classes=2,
         model_arch="gigapath_slide_enc12l768d",
         pretrained="hf_hub:prov-gigapath/prov-gigapath",
@@ -229,28 +395,24 @@ class TileClassificationHead(nn.Module):
         super(TileClassificationHead, self).__init__()
 
         # setup the slide encoder
-        self.feat_layer = [eval(x) for x in feat_layer.split("-")]
-        self.feat_dim = len(self.feat_layer) * latent_dim
-        if self.feat_dim != 768:
-            model_arch = f"gigapath_slide_enc12l{self.feat_dim}d"
-        self.slide_encoder = slide_encoder.create_model(pretrained, model_arch, in_chans=input_dim, **kwargs)
+        # self.feat_layer = [eval(x) for x in feat_layer.split("-")]
+        # self.feat_dim = len(self.feat_layer) * latent_dim
+        # if self.feat_dim != 768:
+        #     model_arch = f"gigapath_slide_enc12l{self.feat_dim}d"
+        # self.slide_encoder = slide_encoder.create_model(pretrained, model_arch, in_chans=input_dim, **kwargs)
 
         # setup the tile classifier
         # self.classifier = nn.Sequential(*[nn.Linear(latent_dim, n_classes)])
 
         self.tile_classifier = nn.Sequential(
-            # nn.Linear(latent_dim, latent_dim // 2),
-            nn.Linear(input_dim, input_dim // 2),
-            # nn.LayerNorm(latent_dim // 2),
+            nn.Linear(tile_input_dim, tile_input_dim // 2), # LocalRef3
+            # nn.Linear(input_dim, input_dim),
             nn.GELU(),
-            # nn.Dropout(dropout),
-            # nn.Linear(latent_dim // 2, latent_dim // 4),
-            nn.Linear(input_dim // 2, input_dim // 4),
-            # nn.LayerNorm(latent_dim // 4),
+            nn.Linear(tile_input_dim // 2, tile_input_dim // 4), # LocalRef3
+            # nn.Linear(input_dim, input_dim),
             nn.GELU(),
-            # nn.Dropout(dropout),
-            # nn.Linear(latent_dim // 4, n_classes),
-            nn.Linear(input_dim // 4, n_classes),
+            nn.Linear(tile_input_dim // 4, n_classes), # LocalRef3
+            # nn.Linear(input_dim, n_classes),
         )
 
         self.tile_log_var_regress = nn.Sequential(
@@ -346,9 +508,9 @@ class TileClassificationHead(nn.Module):
         # h = img_enc.reshape([-1, img_enc.size(-1)])
         # tile_logits = self.tile_classifier(images)
         tile_logits = self.tile_classifier(images)
-        tile_log_vars = self.tile_log_var_regress(images)
+        # tile_log_vars = self.tile_log_var_regress(images)
         tile_logits = tile_logits.view(images.size(0), -1)
-        tile_log_vars = tile_log_vars.view(images.size(0), -1)
+        # tile_log_vars = tile_log_vars.view(images.size(0), -1)
 
         tile_logits_flat = tile_logits.view(-1)
         bins = [0.0, 0.5, 1.0, 1.5, 2.0] # regression bins
@@ -387,15 +549,65 @@ class TileClassificationHead(nn.Module):
                 return logits, tile_logits, tile_log_vars
 
 
+class Her2ResNet(nn.Module):
+    def __init__(self, num_outputs=2):
+        """
+        num_outputs = 1  -> regression
+        num_outputs = 2  -> classification
+        """
+        super().__init__()
+
+        # -------- Backbone (no pretraining) --------
+        self.backbone = models.resnet18(weights=None)
+        # self.backbone = models.mobilenet_v2(weights=None)
+
+        # Replace final FC layer
+        in_features = self.backbone.fc.in_features
+        # in_features = self.backbone.classifier[1].in_features
+        # self.backbone.classifier = nn.Sequential(
+        self.backbone.fc = nn.Sequential(
+            nn.Linear(in_features, 128),
+            nn.ReLU(inplace=True),
+            nn.Dropout(p=0.5),
+            nn.Linear(128, num_outputs)
+        )
+
+    def forward(self, x):
+        return self.backbone(x)
+
+# Linear regression from slide scores and clinical features to slide label
+class LinearClassificationHead(nn.Module):
+    def __init__(self, input_dim, n_classes=2, **kwargs):
+        super(LinearClassificationHead, self).__init__()
+        self.classifier = nn.Linear(input_dim, n_classes)
+
+    def forward(self, slide_score, clinical_features):
+        x = torch.cat([slide_score, clinical_features], dim=0).float()
+        logits = self.classifier(x)
+        return logits
+
+
+
 def get_model(**kwargs):
-    if kwargs["train_on_y"] and not kwargs["pred_y_baseline"]:
+    if kwargs["cnn_on_y"]:
+        model = Her2ResNet()
+        print(f'model = Her2ResNet')
+    elif kwargs["train_on_y"] and not kwargs["pred_y_baseline"]:
         model = TileClassificationHead(**kwargs)
         print(f'model = TileClassificationHead')
-    elif kwargs["score_can_as_sb"] or kwargs["score_can_as_bs"] or kwargs["film"]:
+    elif kwargs["score_can_as_sb"] or kwargs["score_can_as_bs"] or kwargs["film"] or kwargs["weighted_film"]:
         model = ModulatedClassificationHead(**kwargs)
         tile_model = TileClassificationHead(**kwargs)
         print(f'model = ModulatedClassificationHead')
+        if kwargs["load_tile_logits"] or kwargs["tile_slide_model"]:
+            return model
         return tile_model, model
+    elif kwargs["paired_training_mw"] or kwargs["paired_training_mb"] or kwargs["paired_training_cat_h"]:
+        model = PairedClassificationHead(**kwargs)
+        print(f'model = PairedClassificationHead')
+    elif kwargs["clinical_features"]:
+        model = LinearClassificationHead(**kwargs)
+        print(f'model = LinearClassificationHead')
     else:
         model = ClassificationHead(**kwargs)
         

@@ -3,7 +3,7 @@ import torch
 import pandas as pd
 import numpy as np
 
-from training import train, test, generate_heatmap, run_window_inference, train_cycleGAN
+from training import train, test, generate_heatmap, run_window_inference, train_cycleGAN, train_clinic_reg, test_clinic_reg
 from params import get_finetune_params
 from task_configs.utils import load_task_config
 from utils import seed_torch, get_exp_code, get_loader, save_obj, get_test_loader
@@ -12,8 +12,7 @@ from datasets.slide_datatset import SlideDataset, SlidingWindowDataset
 if __name__ == '__main__':
     # Set the hf token
     with open("/home/amitf/workspace/Gigapath_GIP/finetune/hf_token.txt", "r") as file:
-        os.environ["HF_TOKEN"] = file.read()
-    # os.environ["HF_TOKEN"] = ""
+        os.environ["HUGGINGFACE_HUB_TOKEN"] = file.read()
 
     args = get_finetune_params()
     print(args)
@@ -76,7 +75,7 @@ if __name__ == '__main__':
     #DatasetClass = SlideDataset
 
     # use only annotated data for tile classification
-    if args.use_tile_classification or args.window_training or args.only_annotated:
+    if args.only_annotated:
         args.batches = ['Batch_1', 'Batch_2']
         args.slide_path_key = 'Path'
     else:
@@ -103,19 +102,20 @@ if __name__ == '__main__':
             # instantiate the dataset
             train_data, val_data, test_data = DatasetClass(dataset, args.root_path, args.task_config, slide_key=args.slide_key, label = args.label, \
                                                            dataset_name = args.train_dataset, folds = args.train_fold, use_clinical_features = args.clinical_features, censoreship = args.censoreship, survival = args.survival,
-                                                           batches = args.batches, slide_path_key = args.slide_path_key, window_training = args.window_training,
-                                                           teacher_label=args.teacher_label, oversample=args.oversample, use_tile_classification=args.use_tile_classification, comp_power=args.comp_power, 
-                                                           cycle_gan_train=args.cycle_gan_train, synth_ihc_train=args.synth_ihc_train, val_fold=args.val_fold[-1]) \
-                                            , DatasetClass(dataset, args.root_path, args.task_config, slide_key=args.slide_key, label = args.label, \
-                                                           dataset_name = args.val_dataset, folds = args.val_fold, use_clinical_features = args.clinical_features, test_on_all = args.test_on_all, censoreship = args.censoreship, survival = args.survival,
-                                                           batches = args.batches, slide_path_key = args.slide_path_key, window_training = args.window_training,
-                                                           teacher_label=args.teacher_label, comp_power=args.comp_power, cycle_gan_train=args.cycle_gan_train,
-                                                           synth_ihc_train=args.synth_ihc_train, val_fold=args.val_fold[-1]) if len(args.val_dataset) > 0 else None \
-                                            , DatasetClass(dataset, args.root_path, args.task_config, slide_key=args.slide_key, label = args.label, \
-                                                           dataset_name = args.test_dataset, folds = args.test_fold, use_clinical_features = args.clinical_features, test_on_all = args.test_on_all, censoreship = args.censoreship, survival = args.survival, 
-                                                           batches = args.batches, slide_path_key = args.slide_path_key, window_training = args.window_training,
-                                                           teacher_label=args.teacher_label, comp_power=args.comp_power, cycle_gan_train=args.cycle_gan_train,
-                                                           synth_ihc_train=args.synth_ihc_train, val_fold=args.val_fold[-1]) if len(args.test_dataset) > 0 else None
+                                                           batches = args.batches, slide_path_key = args.slide_path_key, window_training = args.window_training, teacher_label=args.teacher_label, 
+                                                           oversample=args.oversample, use_tile_classification=args.use_tile_classification, comp_power=args.comp_power, cycle_gan_train=args.cycle_gan_train,
+                                                           synth_ihc_train=args.synth_ihc_train, val_fold=args.val_fold[-1], y_and_tumor_from_map=args.y_and_tumor_from_map, cnn_on_y=args.cnn_on_y,
+                                                           tile_y_pred_file_name=args.tile_y_pred_file_name, ext_tile_y_pred_file_name=args.ext_tile_y_pred_file_name) \
+                                            , DatasetClass(dataset, args.root_path, args.task_config, slide_key=args.slide_key, label = args.label, dataset_name = args.val_dataset, folds = args.val_fold, 
+                                                           use_clinical_features = args.clinical_features, test_on_all = args.test_on_all, censoreship = args.censoreship, survival = args.survival,
+                                                           batches = args.batches, slide_path_key = args.slide_path_key, window_training = args.window_training, teacher_label=args.teacher_label, 
+                                                           comp_power=args.comp_power, cycle_gan_train=args.cycle_gan_train, synth_ihc_train=args.synth_ihc_train, val_fold=args.val_fold[-1], 
+                                                           y_and_tumor_from_map=args.y_and_tumor_from_map, cnn_on_y=args.cnn_on_y, tile_y_pred_file_name=args.tile_y_pred_file_name, ext_tile_y_pred_file_name=args.ext_tile_y_pred_file_name) if len(args.val_dataset) > 0 else None \
+                                            , DatasetClass(dataset, args.root_path, args.task_config, slide_key=args.slide_key, label = args.label, dataset_name = args.test_dataset, folds = args.test_fold, 
+                                                           use_clinical_features = args.clinical_features, test_on_all = args.test_on_all, censoreship = args.censoreship, survival = args.survival, 
+                                                           batches = args.batches, slide_path_key = args.slide_path_key, window_training = args.window_training, teacher_label=args.teacher_label, 
+                                                           comp_power=args.comp_power, cycle_gan_train=args.cycle_gan_train, synth_ihc_train=args.synth_ihc_train, val_fold=args.val_fold[-1], 
+                                                           y_and_tumor_from_map=args.y_and_tumor_from_map, cnn_on_y=args.cnn_on_y, tile_y_pred_file_name=args.tile_y_pred_file_name, ext_tile_y_pred_file_name=args.ext_tile_y_pred_file_name) if len(args.test_dataset) > 0 else None
             #scale the lr in case of regression
             if args.task_config.get('setting', 'multi_class') == 'continuous' and not args.loss_fn == 'cox':
                 args.mean = train_data.labels.mean()
@@ -123,27 +123,28 @@ if __name__ == '__main__':
                 print("labels mean: %.2e" % args.mean)
                 print("labels std: %.2e" % args.std)
                 print(f'using {args.loss_fn} loss')
-            if args.clinical_features:
+            # if args.clinical_features:
                 # Update model dimensions if using clinical features
-                num_clinical_features = len(train_data.columns)
-                args.input_dim = args.input_dim + num_clinical_features
-                args.latent_dim = args.latent_dim + int(num_clinical_features//2)
-                #latent dim needs to be divisible by 4
-                args.latent_dim = args.latent_dim - args.latent_dim % 4
-                if 'TumorSize' in train_data.columns:
-                    args.tumor_size_mean = train_data.tumor_size_mean
-                    args.tumor_size_std = train_data.tumor_size_std
-                    print("tumor size mean: %.2e" % args.tumor_size_mean)
-                    print("tumor size std: %.2e" % args.tumor_size_std)
-                if 'age' in train_data.columns:
-                    args.age_mean = train_data.age_mean
-                    args.age_std = train_data.age_std
-                    print("age mean: %.2e" % args.age_mean)
-                    print("age std: %.2e" % args.age_std)
+                # num_clinical_features = len(train_data.columns)
+                # args.input_dim = args.input_dim + num_clinical_features
+                # args.latent_dim = args.latent_dim + int(num_clinical_features//2)
+                # #latent dim needs to be divisible by 4
+                # args.latent_dim = args.latent_dim - args.latent_dim % 4
+                # if 'TumorSize' in train_data.columns:
+                #     args.tumor_size_mean = train_data.tumor_size_mean
+                #     args.tumor_size_std = train_data.tumor_size_std
+                #     print("tumor size mean: %.2e" % args.tumor_size_mean)
+                #     print("tumor size std: %.2e" % args.tumor_size_std)
+                # if 'age' in train_data.columns:
+                #     args.age_mean = train_data.age_mean
+                #     args.age_std = train_data.age_std
+                #     print("age mean: %.2e" % args.age_mean)
+                #     print("age std: %.2e" % args.age_std)
+
             args.n_classes = train_data.n_classes # get the number of classes
             # get the dataloader
             train_loader, val_loader, test_loader = get_loader(train_data, val_data, test_data, **vars(args))
-            if not args.cycle_gan_train:
+            if not (args.cycle_gan_train or args.clinical_features):
                 # start training
                 val_records, test_records = train((train_loader, val_loader, test_loader), fold, args)
 
@@ -161,29 +162,33 @@ if __name__ == '__main__':
                         if key_ not in results:
                             results[key_] = []
                         results[key_].append(records[record_][key])
+            elif args.clinical_features:
+                train_clinic_reg((train_loader, val_loader, test_loader), args)
             else:
-                # start training
                 val_records, test_records = train_cycleGAN((train_loader, val_loader, test_loader), fold, args)
     elif args.run_inference or args.generate_heatmap:
         save_dir = os.path.join(args.save_dir, f'inference_results')
         os.makedirs(save_dir, exist_ok=True)
         args.save_dir = save_dir
-        test_data = DatasetClass(dataset, args.root_path, args.task_config, slide_key=args.slide_key, label = args.label, \
-                                 dataset_name = args.test_dataset, folds = args.test_fold, use_clinical_features = args.clinical_features, \
-                                 test_on_all = args.test_on_all, get_single_slide = args.get_single_slide, censoreship = args.censoreship, survival = args.survival,
-                                 batches = args.batches, slide_path_key = args.slide_path_key, window_training = args.window_training, teacher_label=args.teacher_label, 
-                                 comp_power=args.comp_power, synth_ihc_train=args.synth_ihc_train, val_fold=args.val_fold[-1])
-        if args.clinical_features:
-            num_clinical_features = len(test_data.columns)
-            args.input_dim = args.input_dim + num_clinical_features
-            args.latent_dim = args.latent_dim + int(num_clinical_features//2)
-            #latent dim needs to be divisible by 4
-            args.latent_dim = args.latent_dim - args.latent_dim % 4
+        test_data = DatasetClass(dataset, args.root_path, args.task_config, slide_key=args.slide_key, label = args.label, dataset_name = args.test_dataset, folds = args.test_fold, 
+                                 use_clinical_features = args.clinical_features, test_on_all = args.test_on_all, get_single_slide = args.get_single_slide, censoreship = args.censoreship, 
+                                 survival = args.survival, batches = args.batches, slide_path_key = args.slide_path_key, window_training = args.window_training, teacher_label=args.teacher_label, 
+                                 comp_power=args.comp_power, synth_ihc_train=args.synth_ihc_train, val_fold=args.val_fold[-1], y_and_tumor_from_map=args.y_and_tumor_from_map, cnn_on_y=args.cnn_on_y,
+                                 tile_y_pred_file_name=args.tile_y_pred_file_name, ext_tile_y_pred_file_name=args.ext_tile_y_pred_file_name)
+        # if args.clinical_features:
+            # num_clinical_features = len(test_data.columns)
+            # args.input_dim = args.input_dim + num_clinical_features
+            # args.latent_dim = args.latent_dim + int(num_clinical_features//2)
+            # #latent dim needs to be divisible by 4
+            # args.latent_dim = args.latent_dim - args.latent_dim % 4
         args.n_classes = test_data.n_classes
         test_loader = get_test_loader(test_data, **vars(args))
         
         if args.run_inference:
-            test_records = test(test_loader, args)
+            if args.clinical_features:
+                val_records, test_records = test_clinic_reg(test_loader, args=args)
+            else:
+                test_records = test(test_loader, args)
         else:
             generate_heatmap(test_loader, args)
             print('Done!')

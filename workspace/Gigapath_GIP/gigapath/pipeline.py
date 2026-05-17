@@ -2,6 +2,7 @@
 # Pipeline for running with GigaPath
 # --------------------------------------------------------
 import os
+import sys
 import timm
 import torch
 import numpy as np
@@ -12,6 +13,9 @@ from PIL import Image
 from torchvision import transforms
 from typing import List, Tuple, Union
 from torch.utils.data import Dataset, DataLoader
+from timm.data import resolve_data_config
+from timm.data.transforms_factory import create_transform
+from timm.layers import SwiGLUPacked
 
 
 class TileEncodingDataset(Dataset):
@@ -132,3 +136,142 @@ def run_inference_with_slide_encoder(tile_embeds: torch.Tensor, coords: torch.Te
     outputs = {"layer_{}_embed".format(i): slide_embeds[i].cpu() for i in range(len(slide_embeds))}
     outputs["last_layer_embed"] = slide_embeds[-1].cpu()
     return outputs
+
+
+def load_virchow2_tile_encoder() -> torch.nn.Module:
+    # need to specify MLP layer and activation function for proper init
+    tile_encoder = timm.create_model("hf-hub:paige-ai/Virchow2", pretrained=True, mlp_layer=SwiGLUPacked, act_layer=torch.nn.SiLU)
+
+    print("Virchow2 tile encoder param #", sum(p.numel() for p in tile_encoder.parameters()))
+
+    return tile_encoder
+
+
+@torch.no_grad()
+def run_inference_with_virchow2_tile_encoder(image_paths: List[str], tile_encoder: torch.nn.Module, batch_size: int = 128) -> dict:
+    """
+    Run inference with the Virchow2 tile encoder
+
+    Arguments:
+    ----------
+    tile_encoder : torch.nn.Module
+        Virchow2 tile encoder model
+    image_paths : List[str]
+        List of image paths, each image is named with its coordinates
+    """
+    tile_encoder = tile_encoder.cuda()
+    transforms = create_transform(**resolve_data_config(tile_encoder.pretrained_cfg, model=tile_encoder))
+    # make the tile dataloader
+    tile_dl = DataLoader(TileEncodingDataset(image_paths, transform=transforms), batch_size=batch_size, shuffle=False)
+    # run inference
+    tile_encoder.eval()
+    collated_outputs = {"tile_embeds": [], "coords": []}
+    with torch.cuda.amp.autocast(dtype=torch.float16):
+        for batch in tqdm(tile_dl, desc="Running inference with Virchow2 tile encoder"):
+            virchow2_out = tile_encoder(batch["img"].cuda()).detach().cpu() # size: batch_size x 261 x 1280
+            class_token = virchow2_out[:, 0]    # size: 1 x 1280
+            patch_tokens = virchow2_out[:, 5:]  # size: 1 x 256 x 1280, tokens 1-4 are register tokens so we ignore those
+
+            # concatenate class token and average pool of patch tokens
+            embedding = torch.cat([class_token, patch_tokens.mean(1)], dim=-1)  # size: 1 x 2560
+
+            collated_outputs["tile_embeds"].append(embedding)
+            collated_outputs["coords"].append(batch["coords"])
+    return {k: torch.cat(v) for k, v in collated_outputs.items()}
+
+
+def load_uni2_tile_encoder() -> torch.nn.Module:    
+    # pretrained=True needed to load UNI weights (and download weights for the first time)
+    # using UNI2-h as example
+    timm_kwargs = {
+        'img_size': 224, 
+        'patch_size': 14, 
+        'depth': 24,
+        'num_heads': 24,
+        'init_values': 1e-5, 
+        'embed_dim': 1536,
+        'mlp_ratio': 2.66667*2,
+        'num_classes': 0, 
+        'no_embed_class': True,
+        'mlp_layer': timm.layers.SwiGLUPacked, 
+        'act_layer': torch.nn.SiLU, 
+        'reg_tokens': 8, 
+        'dynamic_img_size': True
+    }
+    tile_encoder = timm.create_model("hf-hub:MahmoodLab/UNI2-h", pretrained=True, **timm_kwargs)
+    
+    return tile_encoder
+
+
+@torch.no_grad()
+def run_inference_with_uni2_tile_encoder(image_paths: List[str], tile_encoder: torch.nn.Module, batch_size: int = 128) -> dict:
+    """
+    Run inference with the UNI2 tile encoder
+
+    Arguments:
+    ----------
+    tile_encoder : torch.nn.Module
+        UNI2 tile encoder model
+    image_paths : List[str]
+        List of image paths, each image is named with its coordinates
+    """
+    tile_encoder = tile_encoder.cuda()
+    transforms = create_transform(**resolve_data_config(tile_encoder.pretrained_cfg, model=tile_encoder))
+    # make the tile dataloader
+    tile_dl = DataLoader(TileEncodingDataset(image_paths, transform=transforms), batch_size=batch_size, shuffle=False)
+    # run inference
+    tile_encoder.eval()
+    collated_outputs = {"tile_embeds": [], "coords": []}
+    with torch.cuda.amp.autocast(dtype=torch.float16):
+        for batch in tqdm(tile_dl, desc="Running inference with UNI2 tile encoder"):
+            feature_emb = tile_encoder(batch["img"].cuda()).detach().cpu() # Extracted features (torch.Tensor) with shape [1, 1536]
+
+            collated_outputs["tile_embeds"].append(feature_emb)
+            collated_outputs["coords"].append(batch["coords"])
+    return {k: torch.cat(v) for k, v in collated_outputs.items()}
+
+
+def load_conch_tile_encoder() -> torch.nn.Module:
+    # Define the path to the directory CONTAINING the 'conch' folder
+    conch_repo_path = os.path.join(os.path.expanduser('~'), 'CONCH')
+    if conch_repo_path not in sys.path:
+        sys.path.append(conch_repo_path)
+        
+    from conch.open_clip_custom import create_model_from_pretrained
+    tile_encoder, preprocess = create_model_from_pretrained('conch_ViT-B-16', "hf_hub:MahmoodLab/CONCH", hf_auth_token=os.environ["HUGGINGFACE_HUB_TOKEN"])
+    
+    return tile_encoder, preprocess
+    
+
+@torch.no_grad()
+def run_inference_with_conch_tile_encoder(image_paths: List[str], tile_encoder: torch.nn.Module, preprocess, batch_size: int = 128) -> dict:
+    """
+    Run inference with the UNI2 tile encoder
+
+    Arguments:
+    ----------
+    tile_encoder : torch.nn.Module
+        UNI2 tile encoder model
+    image_paths : List[str]
+        List of image paths, each image is named with its coordinates
+    """
+    tile_encoder = tile_encoder.cuda()
+    # image = preprocess(image).unsqueeze(0)
+    # with torch.inference_mode():
+    #     image_embs = tile_encoder.encode_image(image, proj_contrast=False, normalize=False)
+
+    transforms = preprocess
+    # make the tile dataloader
+    tile_dl = DataLoader(TileEncodingDataset(image_paths, transform=transforms), batch_size=batch_size, shuffle=False)
+    # run inference
+    tile_encoder.eval()
+    collated_outputs = {"tile_embeds": [], "coords": []}
+    with torch.cuda.amp.autocast(dtype=torch.float16):
+        for batch in tqdm(tile_dl, desc="Running inference with Conch tile encoder"):
+            feature_emb = tile_encoder.encode_image(batch["img"].cuda(), proj_contrast=False, normalize=False).detach().cpu() # Extracted features (torch.Tensor) with shape [1, 1536]
+
+            collated_outputs["tile_embeds"].append(feature_emb)
+            collated_outputs["coords"].append(batch["coords"])
+    return {k: torch.cat(v) for k, v in collated_outputs.items()}
+
+    
