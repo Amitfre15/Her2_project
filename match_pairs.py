@@ -8,9 +8,11 @@ import traceback
 import matplotlib.pyplot as plt
 import numpy as np
 import cv2
+import argparse
 from skimage.morphology import disk
 from skimage.morphology import binary_opening
 from skimage.measure import regionprops, label
+import tqdm
 import open3d as o3d
 from scipy.spatial import Delaunay, ConvexHull
 from sklearn.neighbors import NearestNeighbors
@@ -20,6 +22,10 @@ HER2_PATCH_SIZE = 26
 MIN_OUTER_POINTS = '5'
 DESIRED_MPP = 1
 SLIDE_PATCH_SIZE = 256
+EXPECTED_THUMBS = 3 # H&E, Her2, and Her2 copy for orientation checking
+MIN_LANDMARKS = 6 # At least 4 for rigid transformation and 2 for evaluation
+NUM_INIT_LANDMARKS = 4 # At least 4 for rigid transformation
+LANDMARK_COLOR = [0.0, 0.470588, 0.843137] # (0, 120, 215) - Photos default
 
 # Function to load and normalize image
 def load_image(path):
@@ -55,10 +61,10 @@ def load_and_display_thumbs(folder_path: str, HE_thumb_name: str, Her2_thumb_nam
 
     return im_HE, im_Her2, im_Her2_copy, output_mapping_file
 
-def landmark_detection(im_HE: np.array, im_Her2: np.array, color_landmark: np.array, color_threshold: float = 0.001,
+def landmark_detection(im_HE: np.array, im_Her2: np.array, landmark_color: np.array, color_threshold: float = 0.001,
                        display: bool = False):
-    # For each pixel, measure its distance from color_landmark
-    dist_HE = np.sqrt(np.sum((im_HE - color_landmark) ** 2, axis=2))
+    # For each pixel, measure its distance from landmark_color
+    dist_HE = np.sqrt(np.sum((im_HE - landmark_color) ** 2, axis=2))
 
     dist_HE_b = dist_HE < color_threshold  # % distance < color_threshold should be true for the pixels of the landmarks
     dist_HE_b = binary_opening(dist_HE_b, disk(2))  # remove small noise pixels
@@ -72,7 +78,7 @@ def landmark_detection(im_HE: np.array, im_Her2: np.array, color_landmark: np.ar
     S_land_HE = np.array([region.centroid for region in regions_HE])
 
     # Repeat for Her2
-    dist_Her2 = np.sqrt(np.sum((im_Her2 - color_landmark) ** 2, axis=2))
+    dist_Her2 = np.sqrt(np.sum((im_Her2 - landmark_color) ** 2, axis=2))
     dist_Her2_b = dist_Her2 < color_threshold
     dist_Her2_b = binary_opening(dist_Her2_b, disk(2))
 
@@ -425,27 +431,6 @@ def transform_sub_group(PT_HE_chosen: np.array, PT_HE_unchosen: np.array, PT_Her
                         im_HE: np.array, im_Her2: np.array, S_land_HE_3d: np.array, HE_3d_chosen: np.array,
                         HE_3d_unchosen: np.array, Her2_3d_chosen: np.array, Her2_3d_unchosen: np.array, metric_point: np.array,
                         metric_point_3d: np.array, Her2_metric_point_3d: np.array, icp_threshold: int = 500):
-    # tri_dist, rigid_dist = {}, {}
-
-    # im_map_tmp = triangulate_and_create_map(PT_HE=PT_HE_chosen, PT_Her2=PT_Her2_chosen, im_HE=im_HE,
-    #                                         im_Her2=im_Her2, display=False)
-
-    # mapped_metric_point = im_map_tmp[(metric_point[0]).astype(int), (metric_point[1]).astype(int)][:2][
-    #                       ::-1]  # reverse the coordinate order
-    # if not np.allclose(mapped_metric_point, np.zeros_like(mapped_metric_point.shape), atol=1e-8):
-    #     metric_tri_dist = np.sqrt(np.sum((Her2_metric_point - mapped_metric_point) ** 2))
-    #     tri_dist[PT_HE_chosen.shape[0]] = metric_tri_dist, chosen_area / max_area
-
-    # mapped_pairs = im_map_tmp[(PT_HE_unchosen[:, 0]).astype(int), (PT_HE_unchosen[:, 1]).astype(int)][:, :2][:, ::-1]  # reverse the coordinate order
-    # # Keep only rows different from [0.0, 0.0]
-    # relevant_mask = ~np.all(mapped_pairs == [0.0, 0.0], axis=1)
-    # if not any(relevant_mask):
-    #     return None, None
-    # mapped_pairs = mapped_pairs[relevant_mask]
-    #
-    # mean_tri_dist = np.mean(np.sqrt(np.sum((PT_Her2_unchosen[relevant_mask] - mapped_pairs) ** 2, axis=1)))
-    # tri_dist[PT_HE_chosen.shape[0]] = mean_tri_dist  # , chosen_area / max_area
-
     # Rigid evaluation
     trnsfrm_fitness = 0
     icp_trials = 0
@@ -454,21 +439,10 @@ def transform_sub_group(PT_HE_chosen: np.array, PT_HE_unchosen: np.array, PT_Her
 
     mean_dists = []
     while (mean_rigid_dist > 100 or trnsfrm_fitness < 0.9) and curr_thresh > 0:
-        best_results = find_and_apply_best_trnsfrm(S_land_HE_3d=HE_3d_chosen, S_land_Her2_3d=Her2_3d_chosen,
-                                                                              # left_out_points=Her2_3d_unchosen,
-                                                                              # left_out_points=Her2_metric_point_3d,
-                                                                              left_out_points=metric_point_3d,
-                                                                              # left_out_true_pairs=HE_3d_unchosen,
-                                                                              # left_out_true_pairs=metric_point_3d,
-                                                                              left_out_true_pairs=Her2_metric_point_3d,
-                                                                              icp_threhold=curr_thresh,
-                                                                              display=False,
-                                                                              # relevant_mask=relevant_mask
-                                                                              )
+        best_results = find_and_apply_best_trnsfrm(S_land_HE_3d=HE_3d_chosen, S_land_Her2_3d=Her2_3d_chosen, left_out_points=metric_point_3d,
+                                                   left_out_true_pairs=Her2_metric_point_3d, icp_threhold=curr_thresh, display=False)
         trnsfrm_fitness, transformed_lo = best_results[1], best_results[2]
 
-        # mean_rigid_dist = np.mean(np.sqrt(np.sum((HE_3d_unchosen - transformed_lo)[relevant_mask] ** 2, axis=1)))
-        # mean_rigid_dist = np.sqrt(np.sum((metric_point_3d - transformed_lo) ** 2))
         mean_rigid_dist = np.sqrt(np.sum((Her2_metric_point_3d - transformed_lo) ** 2))
         mean_dists.append(mean_rigid_dist)
         icp_trials += 1
@@ -483,15 +457,12 @@ def evaluate_w_sub_group(PT_HE: np.array, PT_Her2: np.array, im_HE: np.array, im
                          S_land_Her2_3d: np.array, HE_Her2_land_mapping: np.array,
                          inner_points_indices: np.array, metric_point_index: np.array = None):
     tri_dist, rigid_dist = {}, {}
-    # S_land_Her2_3d_mapped = S_land_Her2_3d[HE_Her2_land_mapping]
     S_land_HE_3d = S_land_HE_3d[HE_Her2_land_mapping]
 
     metric_point, metric_point_3d, Her2_metric_point_3d = np.empty((1, 1)), np.empty((1, 1)), np.empty((1, 1))
     # init metric point for both triangulation and rigid transform
     metric_point, Her2_metric_point = PT_HE[metric_point_index].reshape(1, -1), PT_Her2[metric_point_index].reshape(1, -1)
     PT_HE, PT_Her2 = np.delete(PT_HE, metric_point_index, axis=0), np.delete(PT_Her2, metric_point_index, axis=0)
-    # metric_point_3d, Her2_metric_point_3d = S_land_HE_3d[metric_point_index].reshape(1, -1), S_land_Her2_3d_mapped[metric_point_index].reshape(1, -1)
-    # S_land_HE_3d, S_land_Her2_3d_mapped = np.delete(S_land_HE_3d, metric_point_index, axis=0), np.delete(S_land_Her2_3d_mapped, metric_point_index, axis=0)
     metric_point_3d, Her2_metric_point_3d = S_land_HE_3d[metric_point_index].reshape(1, -1), S_land_Her2_3d[
         metric_point_index].reshape(1, -1)
     S_land_HE_3d, S_land_Her2_3d_mapped = np.delete(S_land_HE_3d, metric_point_index, axis=0), np.delete(
@@ -505,46 +476,23 @@ def evaluate_w_sub_group(PT_HE: np.array, PT_Her2: np.array, im_HE: np.array, im
 
     # max_area = calculate_area(points=PT_HE)
 
-    # start with 4 points
-    while PT_HE_chosen.shape[0] < 4:
+    while PT_HE_chosen.shape[0] < NUM_INIT_LANDMARKS:
         top_index, chosen_area = diversity_sampling(chosen_points=PT_HE_chosen, unchosen_points=PT_HE_unchosen)
-        # for ind, point in enumerate(PT_HE):
-            # if np.allclose(point, PT_HE_unchosen[top_index], atol=1e-8) and ind in inner_points_indices:
-            #     inner_points_indices.pop(top_index)
-        arrays_tuple = choose_top_index(PT_HE_chosen=PT_HE_chosen, PT_HE_unchosen=PT_HE_unchosen,
-                                        PT_Her2_chosen=PT_Her2_chosen,
-                                        PT_Her2_unchosen=PT_Her2_unchosen, HE_3d_chosen=HE_3d_chosen,
-                                        HE_3d_unchosen=HE_3d_unchosen,
-                                        Her2_3d_chosen=Her2_3d_chosen, Her2_3d_unchosen=Her2_3d_unchosen,
-                                        top_index=top_index)
+        arrays_tuple = choose_top_index(PT_HE_chosen=PT_HE_chosen, PT_HE_unchosen=PT_HE_unchosen, PT_Her2_chosen=PT_Her2_chosen,
+                                        PT_Her2_unchosen=PT_Her2_unchosen, HE_3d_chosen=HE_3d_chosen, HE_3d_unchosen=HE_3d_unchosen,
+                                        Her2_3d_chosen=Her2_3d_chosen, Her2_3d_unchosen=Her2_3d_unchosen, top_index=top_index)
         PT_HE_chosen, PT_HE_unchosen, PT_Her2_chosen, PT_Her2_unchosen, HE_3d_chosen, HE_3d_unchosen, Her2_3d_chosen, Her2_3d_unchosen = arrays_tuple
 
-    # inner_points = PT_HE[inner_points_indices]
-    # # Create a mask for elements in PT_HE_unchosen that are NOT in inner_points
-    # outer_unchosen_mask = np.all(~np.isin(PT_HE_unchosen, inner_points), axis=1)
-    #
-    # # Use the mask to filter out elements
-    # outer_unchosen_indices = np.where(outer_unchosen_mask)[0]
-    # if len(outer_unchosen_indices) == 0:
-    #     print('No more outer landmarks to choose')
-    #     tri_dist = 'No more outer landmarks to choose'
-    # else:
-    # for j in range(1, outer_unchosen_indices.shape[0] + 1):
     unchosen_indices = np.arange(PT_HE_unchosen.shape[0])
     for j in range(1, PT_HE_unchosen.shape[0] + 1):
         tmp_len = PT_HE_chosen.shape[0] + j
         tri_dist[str(tmp_len)], rigid_dist[str(tmp_len)] = [], []
-        # Generate all possible index groups of size j
-        # index_groups = list(itertools.combinations(outer_unchosen_indices, j))[:20]
         possible_ind_groups = list(itertools.combinations(unchosen_indices, j))
         index_groups = random.sample(possible_ind_groups, min(len(possible_ind_groups), 10))
         for ind_gr in index_groups:
-            arrays_tuple = choose_top_index(PT_HE_chosen=PT_HE_chosen, PT_HE_unchosen=PT_HE_unchosen,
-                                            PT_Her2_chosen=PT_Her2_chosen,
-                                            PT_Her2_unchosen=PT_Her2_unchosen, HE_3d_chosen=HE_3d_chosen,
-                                            HE_3d_unchosen=HE_3d_unchosen,
-                                            Her2_3d_chosen=Her2_3d_chosen, Her2_3d_unchosen=Her2_3d_unchosen,
-                                            top_index=np.array(ind_gr))
+            arrays_tuple = choose_top_index(PT_HE_chosen=PT_HE_chosen, PT_HE_unchosen=PT_HE_unchosen, PT_Her2_chosen=PT_Her2_chosen,
+                                            PT_Her2_unchosen=PT_Her2_unchosen, HE_3d_chosen=HE_3d_chosen, HE_3d_unchosen=HE_3d_unchosen,
+                                            Her2_3d_chosen=Her2_3d_chosen, Her2_3d_unchosen=Her2_3d_unchosen, top_index=np.array(ind_gr))
             PT_HE_chosen_tmp, PT_HE_unchosen_tmp, PT_Her2_chosen_tmp, PT_Her2_unchosen_tmp, HE_3d_chosen_tmp, HE_3d_unchosen_tmp, Her2_3d_chosen_tmp, Her2_3d_unchosen_tmp = arrays_tuple
 
             # mean_tri_dist, mean_rigid_dist = transform_sub_group(PT_HE_chosen=PT_HE_chosen_tmp, PT_HE_unchosen=PT_HE_unchosen_tmp,
@@ -832,7 +780,7 @@ def diversity_sampling(chosen_points, unchosen_points, n_select=1):
 def rotate_back_annotation_img(im_Her2: np.array, im_Her2_copy: np.array, display: bool = False):
     rotation_imgs_diffs = []
 
-    for i in range(4):
+    for _ in range(4):
         if im_Her2.shape == im_Her2_copy.shape:
             rotation_imgs_diffs.append((im_Her2, np.sum((im_Her2 - im_Her2_copy) ** 2)))
 
@@ -935,36 +883,34 @@ def parse_thumb_names(png_images: list):
 
 def main():
     # Argument parser
-    # parser = argparse.ArgumentParser(description="Search and replace file names and content based on Excel mapping.")
-    # parser.add_argument('-r', '--root', required=True, help='Root directory to search for files.')
-    # parser.add_argument('-m', '--mapping_file', required=True,
-    #                     help='Excel file with current_name and changed_name columns.')
+    parser = argparse.ArgumentParser(description="Match pairs of thumbnails through a mapping matrix.")
+    parser.add_argument('-r', '--root', default=os.path.join('slides_to_amit2', 'match_thumbs_HE_Her2', 'Marked', 'png_thumb_pairs_karin'), help='Root directory to search for thumbnail pairs.')
+    parser.add_argument('-dn', '--dict_name', type=str, default='rigid_one_out_LS', help='Name for the distance dictionary saved.')
+    parser.add_argument('-d', '--display', action='store_true', default=False, help='Whether to display images and plots during processing.')
+    parser.add_argument('-ut', '--use_triangulation', action='store_true', default=False, help='Whether to match using Delunay triangulation.')
 
-    # args = parser.parse_args()
-    # print(f'args = {args}')
-
-    display = False
-
-    # marked_folder_path = os.path.join(os.sep, 'SSDStorage', 'Breast', 'Carmel', 'png_thumb_pairs_karin')
+    args = parser.parse_args()
+    print(f'args = {args}')
+    
     marked_folder_path = os.path.join('slides_to_amit2', 'match_thumbs_HE_Her2', 'Marked', 'png_thumb_pairs_karin')
-    # marked_folder_path = os.path.join('slides_to_amit2', 'match_thumbs_HE_Her2', 'Marked', 'OneDrive_1_20-01-2025')
+    
     # tri_dist_path = os.path.join(marked_folder_path, 'tri_one_out_LS.json')
-    rigid_dist_path = os.path.join(marked_folder_path, 'rigid_one_out_LS.json')
+    rigid_dist_path = os.path.join(marked_folder_path, f'{args.dict_name}.json')
 
 
-    # tri_dist, rigid_dist = [], []
     # tri_dist, rigid_dist = init_dist_dict(tri_dist_path), init_dist_dict(rigid_dist_path)
     rigid_dist = init_dist_dict(rigid_dist_path)
 
+    dirs_to_iterate = os.listdir(marked_folder_path)
     try:
-        for ind, dir in enumerate(os.listdir(marked_folder_path)):
+        for _, dir in tqdm(dirs_to_iterate, total=len(dirs_to_iterate)):
             print(f'dir = {dir}')
             # if dir in tri_dist:
-            if dir in rigid_dist and dir != '19-9595_1_1':  #
-                print(f'Directory already done')
-                continue
-            if dir != '19-9595_1_1':
-                continue
+            # if dir in rigid_dist and dir != '19-9595_1_1':  #
+            #     print(f'Directory already done')
+            #     continue
+            # if dir != '19-9595_1_1':
+            #     continue
 
             # Initialize paths
             folder = os.path.join(marked_folder_path, dir)
@@ -973,7 +919,7 @@ def main():
                 continue
 
             png_images = list(filter(lambda x: x.endswith('.png') and not x.startswith('map') and not x.startswith('Transformed'), os.listdir(folder)))
-            if len(png_images) < 3:
+            if len(png_images) < EXPECTED_THUMBS:
                 # tri_dist[dir] = 'Directory does not contain enough images'
                 rigid_dist[dir] = 'Directory does not contain enough images'
                 print('Directory does not contain enough images')
@@ -981,53 +927,45 @@ def main():
 
             thumb_HE, thumb_Her2, thumb_Her2_copy = parse_thumb_names(png_images=png_images)
 
-            im_HE, im_Her2, im_Her2_copy, output_mapping_file = load_and_display_thumbs(folder_path=folder,
-                                                                                        HE_thumb_name=thumb_HE,
-                                                                                        Her2_thumb_name=thumb_Her2,
-                                                                                        Her2_thumb_copy_name=thumb_Her2_copy,
-                                                                                        display=False)
+            im_HE, im_Her2, im_Her2_copy, output_mapping_file = load_and_display_thumbs(folder_path=folder, HE_thumb_name=thumb_HE, Her2_thumb_name=thumb_Her2,
+                                                                                        Her2_thumb_copy_name=thumb_Her2_copy, display=args.display)
 
-            im_Her2 = rotate_back_annotation_img(im_Her2=im_Her2, im_Her2_copy=im_Her2_copy, display=False)
+            im_Her2 = rotate_back_annotation_img(im_Her2=im_Her2, im_Her2_copy=im_Her2_copy, display=args.display)
             if type(im_Her2) is int:
                 rigid_dist[dir] = 'Could not rotate Her2 image back to original orientation'
                 continue
 
-            # Find landmarks in H&E thumb
-            # color_landmark = np.array([0.0156863, 0.2, 1])  # (4, 51, 255)
-            color_landmark = np.array([0.0, 0.470588, 0.843137]).astype(np.float32)  # (0, 120, 215) - Photos default
-            # color_landmark = np.array([0.0, 0.0, 0.0]) if ind > 17 else np.array([0.0156863, 0.2, 1])  # (4, 51, 255)
+            # Find landmarks
+            landmark_color = np.array(LANDMARK_COLOR).astype(np.float32)
+
             try:
                 if dir in rigid_dist:
                     rigid_dist.pop(dir)
-                S_land_HE, S_land_Her2 = landmark_detection(im_HE=im_HE, im_Her2=im_Her2, color_landmark=color_landmark, display=False)
+                S_land_HE, S_land_Her2 = landmark_detection(im_HE=im_HE, im_Her2=im_Her2, landmark_color=landmark_color, display=args.display)
                 if len(S_land_HE) == 0:  # try other landmark color (black)
-                    S_land_HE, S_land_Her2 = landmark_detection(im_HE=im_HE, im_Her2=im_Her2, color_landmark=np.array([0.0, 0.0, 0.0]))
+                    S_land_HE, S_land_Her2 = landmark_detection(im_HE=im_HE, im_Her2=im_Her2, landmark_color=np.array([0.0, 0.0, 0.0]))
             except ValueError as e:
                 rigid_dist[dir] = str(e)
                 print(e)
                 continue
 
-            if len(S_land_HE) < 6:
+            if len(S_land_HE) < MIN_LANDMARKS:
                 rigid_dist[dir] = f'Insufficient landmark count: {len(S_land_HE)}'
                 print(f'Insufficient landmark count: {len(S_land_HE)}')
                 continue
 
-            # pts_moving = S_land_Her2
-            pts_moving = S_land_HE / 2
-            # pts_fixed = S_land_HE / 2
+            pts_moving = S_land_HE / 2  # HE thumbs were created twice the size of the Her2 thumbs for some reason
             pts_fixed = S_land_Her2
 
-            # S_land_HE_3d = np.hstack([pts_fixed, np.zeros((len(S_land_HE), 1))])  # For point cloud
             S_land_HE_3d = np.hstack([pts_moving, np.zeros((len(S_land_HE), 1))])  # For point cloud
-            # S_land_Her2_3d = np.hstack([pts_moving, np.zeros((len(S_land_Her2), 1))])
             S_land_Her2_3d = np.hstack([pts_fixed, np.zeros((len(S_land_Her2), 1))])
-            if display:
+
+            if args.display:
                 plot_landmarks(S_land_HE_3d[:, [1, 0, 2]], S_land_Her2_3d[:, [1, 0, 2]],
                                f'Initial H&E Landmarks - {dir}', 'Her2 Landmarks')
 
-            HE_Her2_land_mapping, pairs_dist, best_trnsfrm, trans_init_rotated, translation = match_landmarks(S_land_HE_3d=S_land_HE_3d,
-                                                                                                              S_land_Her2_3d=S_land_Her2_3d,
-                                                                                                              display=True)
+            HE_Her2_land_mapping, pairs_dist, best_trnsfrm, trans_init_rotated, translation = match_landmarks(S_land_HE_3d=S_land_HE_3d, S_land_Her2_3d=S_land_Her2_3d, display=args.display)
+
             # Check for duplicate elements
             _, counts = np.unique(HE_Her2_land_mapping, return_counts=True)
             has_duplicates = np.any(counts > 1)
@@ -1038,8 +976,6 @@ def main():
 
             # Mapping for H&E and Her2
             PT_HE = S_land_HE[HE_Her2_land_mapping]
-            # PT_HE = pts_moving
-            # PT_Her2 = S_land_Her2[HE_Her2_land_mapping]
             PT_Her2 = S_land_Her2
 
             inner_points_mask = get_inner_hull_point_mask(points=PT_HE)
@@ -1047,13 +983,9 @@ def main():
             for i in np.arange(PT_HE.shape[0]):
                 metric_point_index = i
                 inner_points_indices = np.where(inner_points_mask)[0]
-                curr_tri_dist, curr_rigid_dist = evaluate_w_sub_group(PT_HE=PT_HE,  # PT_HE=pts_moving,
-                                                                      PT_Her2=PT_Her2, im_HE=im_HE,
-                                                                      im_Her2=im_Her2, S_land_HE_3d=S_land_HE_3d,
-                                                                      S_land_Her2_3d=S_land_Her2_3d,
-                                                                      HE_Her2_land_mapping=HE_Her2_land_mapping,
-                                                                      inner_points_indices=inner_points_indices,
-                                                                      metric_point_index=metric_point_index)
+                curr_tri_dist, curr_rigid_dist = evaluate_w_sub_group(PT_HE=PT_HE, PT_Her2=PT_Her2, im_HE=im_HE, im_Her2=im_Her2, S_land_HE_3d=S_land_HE_3d,
+                                                                      S_land_Her2_3d=S_land_Her2_3d, HE_Her2_land_mapping=HE_Her2_land_mapping,
+                                                                      inner_points_indices=inner_points_indices, metric_point_index=metric_point_index)
                 if dir not in rigid_dist:
                     # tri_dist[dir] = curr_tri_dist
                     rigid_dist[dir] = curr_rigid_dist
@@ -1066,13 +998,11 @@ def main():
 
             im_map = create_rigid_map(PT_HE=PT_HE, PT_Her2=PT_Her2, im_HE=im_HE, im_Her2=im_Her2, dir_name=dir, base_path=marked_folder_path)
             # im_map = triangulate_and_create_map(PT_HE=PT_HE, PT_Her2=PT_Her2, im_HE=im_HE, im_Her2=im_Her2)
-            #
-            # Convert the image to 8-bit unsigned integers
-            img_16bit = im_map.astype(np.uint16)
 
+            img_16bit = im_map.astype(np.uint16)
             # Now we can use cv2.cvtColor
             bgr_im_map = cv2.cvtColor(img_16bit, cv2.COLOR_RGB2BGR)
-            # display_image(img=bgr_im_map)
+
             cv2.imwrite(output_mapping_file, bgr_im_map)
             print(f'saved mapping file to {output_mapping_file}')
 
@@ -1100,159 +1030,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-    # # Given data as numpy arrays
-    # tri_dist = np.array([
-    #     10.03883224, 45.20179753, 37.6084809, 24.81791358, 16.70417869, 27.34309731,
-    #     26.1130023, 22.81568661, 29.1585703, 15.60626655, 24.4994331, 28.05748068,
-    #     23.94054558, 4.21718431, 5.37400052, 10.86893968, 13.54935883, 14.73978681,
-    #     11.10065857, 12.83426889, 11.51144108, 23.17967749, 16.35209386, 23.94573381,
-    #     16.66999967, 3.34995854, 9.06764701, 10.749677, 36.31005027, 12.26075957,
-    #     35.77189377, 36.06582165, 35.20498507, 46.13121303, 25.24654072, 6.89885261,
-    #     61.21746723, 76.0274003, 66.0767269, 88.45189102, 7.85632922, 23.3896222,
-    #     53.50689765, 11.0053438, 6.90133202, 9.29622238, 56.94048043, 12.80269343,
-    #     3.26342862, 36.70829267, 21.67470572, 42.94899763, 56.56314762, 65.22215975,
-    #     29.52979096, 42.79278236, 77.84314713, 31.52600338, 6.74948558, 33.74742789,
-    #     18.30110767, 7.89469603, 5.85087174, 4.24801716, 25.67314546, 23.42126289,
-    #     12.97005097, 2.4267033, 21.73067468, 29.53340858, 22.78067705, 14.3097439,
-    #     12.02077074, 25.44163334, 29.38184099, 35.55644574, 11.23375903, 13.94173393,
-    #     9.06977585, 24.40935045, 10.08332943, 56.6665009, 25.83667171, 97.73413248,
-    #     40.24661269, 29.61484329, 10.59381142, 29.08479183, 16.85033268, 15.55955978,
-    #     18.68360185, 14.67712343, 9.96021676, 15.2432864, 48.05856981, 16.45547676,
-    #     35.2754763, 39.29417038, 36.50505464, 77.76177104, 29.43803088, 40.17408484,
-    #     13.55901075
-    # ])
-    #
-    # rigid_dist = np.array([
-    #     3.78385135, 50.56527605, 22.40750206, 23.04012448, 14.28585017,
-    #     19.5278628, 4.69962848, 17.98866511, 10.94150182, 13.56472502,
-    #     15.67137755, 9.61621343, 26.57650013, 12.55367715, 5.5109596,
-    #     23.3924256, 59.04020882, 44.545065, 17.77278119, 54.94558654,
-    #     5.64261532, 13.92565432, 13.31798422, 18.37661341, 22.0625028,
-    #     14.39670045, 9.5020172, 1.04151958, 22.91021481, 25.97685311,
-    #     33.91587594, 38.85748956, 26.03558135, 51.02857928, 39.03474551,
-    #     31.98495344, 39.36492668, 97.49393235, 83.43399, 50.59011517,
-    #     6.15042138, 15.47073101, 7.36677328, 45.76023971, 51.60343171,
-    #     19.82823302, 25.18934756, 7.13439341, 6.12962674, 96.97989263,
-    #     95.2590565, 64.40454616, 15.11687392, 29.18388706, 36.38702459,
-    #     22.934182, 28.88748333, 48.93935444, 60.98116922, 49.1220076,
-    #     41.25754815, 19.45755143, 18.70913121, 7.78272333, 33.46507857,
-    #     10.52183465, 2.95256404, 6.79606654, 43.7163289, 37.68818898,
-    #     72.91862621, 56.13078184, 8.76027704, 27.91538706, 25.5510089,
-    #     44.38074149, 2.73488157, 9.9496242, 12.16916047, 22.01246078,
-    #     41.04676196, 53.54936436, 13.94182651, 101.36108441, 21.45753803,
-    #     28.18494631, 48.04952857, 13.36783054, 5.45086462, 8.70348268,
-    #     26.09070381, 31.46460621, 24.90688994, 22.66567023, 54.6071548,
-    #     14.62536511, 18.70278915, 32.58019979, 43.68864578, 94.50784221,
-    #     16.48687765, 17.3821217, 5.88521505
-    # ])
-    # dist_pairs = list(zip(tri_dist / 26, rigid_dist / 26))
-    # sorted_dists = sorted(dist_pairs, key=lambda x: x[1] - x[0])
-    # sorted_tri_dist, sorted_rigid_dist = [d[0] for d in sorted_dists], [d[1] for d in sorted_dists]
-    # show_dist_plot(tri_dist=sorted_tri_dist, rigid_dist=sorted_rigid_dist)
-    # # show_dist_hist(tri_dist=tri_dist, rigid_dist=rigid_dist)
-
-    # ******** area trial ********
-    # data_dict = {'17-8750_2_10': {4: (22.02441207279937, np.array([0.90462975])), 5: (19.739386002997833, np.array([0.9548438])),
-    #                   6: (19.54238162387375, np.array([0.98076832])), 7: (19.54238162387375, np.array([1.])),
-    #                   8: (25.859610693054993, np.array([1.])), 9: (26.50624762672625, np.array([1.])),
-    #                   10: (10.03883223969227, np.array([1.]))},
-    #  '17-9612_1_8': {4: (29.011326231390722, np.array([0.69941711])), 5: (31.27536426162592, np.array([0.81000723])),
-    #                  6: (31.27536426162592, np.array([0.91439682])), 7: (22.744527822896345, np.array([0.96499244])),
-    #                  8: (22.744527822896345, np.array([0.97828497])), 9: (22.744527822896345, np.array([0.98658425])),
-    #                  10: (22.744527822896345, np.array([0.99274814])), 11: (21.76150063275847, np.array([0.9976953])),
-    #                  12: (21.76150063275847, np.array([1.])), 13: (16.70417869273491, np.array([1.]))},
-    #  '20-10017_1_1': {4: (24.801164375537617, np.array([0.82872286])), 5: (20.795540657013355, np.array([0.9016647])),
-    #                   6: (21.875917836996578, np.array([0.96378935])), 7: (21.875917836996578, np.array([1.])),
-    #                   8: (20.48031856272022, np.array([1.])), 9: (20.960199468469046, np.array([1.])),
-    #                   10: (21.746349504723725, np.array([1.])), 11: (26.748550746816555, np.array([1.])),
-    #                   12: (26.11300229557859, np.array([1.]))},
-    #  '20-10023_2_10': {4: (24.430693476786313, np.array([0.66445652])), 5: (24.430693476786313, np.array([0.82277207])),
-    #                    6: (22.362438055858533, np.array([0.91131877])), 7: (20.851903236541464, np.array([0.99602629])),
-    #                    8: (21.151967323679216, np.array([1.])), 9: (24.09275250386426, np.array([1.])),
-    #                    10: (17.093469621166506, np.array([1.])), 11: (23.940545583843754, np.array([1.]))},
-    #  '20-10023_2_5': {4: (24.32094198517525, np.array([0.6873434])), 5: (28.924201613022166, np.array([0.88718867])),
-    #                   6: (28.87439478246895, np.array([0.95869799])), 7: (28.87439478246895, np.array([0.99210916])),
-    #                   8: (15.49999400035329, np.array([0.99809361])), 9: (20.49484135390564, np.array([1.])),
-    #                   10: (27.776759905173893, np.array([1.])), 11: (21.5476007070303, np.array([1.])),
-    #                   12: (13.549358830459804, np.array([1.]))},
-    #  '20-10040_1_1': {4: (11.281519491137912, np.array([0.72963072])), 5: (10.444358937689682, np.array([0.8750629])),
-    #                   6: (13.961020843774618, np.array([0.93940333])), 7: (13.961020843774618, np.array([0.97152163])),
-    #                   8: (19.887824130595416, np.array([0.99281344])), 9: (19.285320533884846, np.array([1.])),
-    #                   10: (18.950423284362408, np.array([1.])), 11: (17.819026439767924, np.array([1.])),
-    #                   12: (11.511441078786273, np.array([1.]))},
-    #  '20-10043_1_1': {4: (15.089850913733002, np.array([0.7894286])), 5: (15.208940791376083, np.array([0.93355799])),
-    #                   6: (15.208940791376083, np.array([0.95902296])), 7: (17.46342096438474, np.array([0.98114772])),
-    #                   8: (10.78508884035425, np.array([0.99663517])), 9: (10.78508884035425, np.array([1.])),
-    #                   10: (8.368549218584466, np.array([1.])), 11: (8.238432649704013, np.array([1.])),
-    #                   12: (16.669999666733165, np.array([1.]))},
-    #  '20-10103_1_1': {4: (30.87764616215523, np.array([0.82172546])), 5: (25.892620589648484, np.array([0.99756754])),
-    #                   6: (29.97411099477561, np.array([1.])), 7: (28.03206580454283, np.array([1.])),
-    #                   8: (32.74157720836558, np.array([1.])), 9: (37.18594159792452, np.array([1.])),
-    #                   10: (21.793891164906995, np.array([1.])), 11: (36.31005026890629, np.array([1.]))},
-    #  '20-10105_1_1': {4: (65.00167902628029, np.array([0.91526374])), 5: (65.00167902628029, np.array([0.97216685])),
-    #                   6: (65.00167902628029, np.array([1.])), 7: (75.55127916418328, np.array([1.])),
-    #                   8: (60.201983217579794, np.array([1.])), 9: (38.424044815287154, np.array([1.])),
-    #                   10: (17.989132444529055, np.array([1.])), 11: (25.246540715317455, np.array([1.]))},
-    #  '20-10147_1_1': {4: (30.313248344480474, np.array([1.])), 5: (35.68544774266485, np.array([1.])),
-    #                   6: (40.03598318311568, np.array([1.])), 7: (15.195670534354095, np.array([1.])),
-    #                   8: (7.856329219418876, np.array([1.]))},
-    #  '20-10148_1_1': {4: (11.620557727265588, np.array([0.73330697])), 5: (10.531509992891625, np.array([0.80274007])),
-    #                   6: (10.607741140916936, np.array([0.87158508])), 7: (22.16247302467939, np.array([0.90813354])),
-    #                   8: (22.16247302467939, np.array([0.94178661])), 9: (33.476464462978655, np.array([0.97196006])),
-    #                   10: (32.53456384988357, np.array([0.9955288])), 11: (32.53456384988357, np.array([1.])),
-    #                   12: (56.00575583423509, np.array([1.])), 13: (33.11835140514921, np.array([1.])),
-    #                   14: (9.296222379575177, np.array([1.]))},
-    #  '20-10169_1_1': {4: (43.30017850235388, np.array([0.85697408])), 5: (35.06157214060757, np.array([0.99156116])),
-    #                   6: (34.9659104089476, np.array([1.])), 7: (37.2318121865967, np.array([1.])),
-    #                   8: (31.725107624282174, np.array([1.])), 9: (23.844910748365006, np.array([1.])),
-    #                   10: (29.19149919410155, np.array([1.])), 11: (36.70829266637958, np.array([1.]))},
-    #  '20-10170_1_1': {4: (69.62141103002352, np.array([0.71225354])), 5: (70.05624234527711, np.array([0.85379493])),
-    #                   6: (51.46601809751449, np.array([0.9471753])), 7: (51.46601809751449, np.array([0.98277889])),
-    #                   8: (51.46601809751449, np.array([1.])), 9: (46.83892502764163, np.array([1.])),
-    #                   10: (30.61801253780543, np.array([1.])), 11: (48.635924212078756, np.array([1.])),
-    #                   12: (42.79278236130744, np.array([1.]))},
-    #  '20-10177_1_6': {4: (27.714907244241832, np.array([0.69944925])), 5: (27.11078493385507, np.array([0.95623382])),
-    #                   6: (20.27783888298085, np.array([0.9974134])), 7: (20.102456721165613, np.array([1.])),
-    #                   8: (12.9715343758245, np.array([1.])), 9: (10.874001018951896, np.array([1.])),
-    #                   10: (13.385565656168763, np.array([1.])), 11: (18.301107668592437, np.array([1.]))},
-    #  '20-10179_1_9': {4: (40.635841044770395, np.array([0.76253275])), 5: (33.71885841782669, np.array([0.87187045])),
-    #                   6: (29.905304002574827, np.array([0.93550289])), 7: (29.905304002574827, np.array([0.97060773])),
-    #                   8: (17.712446256502336, np.array([1.])), 9: (16.408775776055922, np.array([1.])),
-    #                   10: (13.801596223609982, np.array([1.])), 11: (17.090317666070014, np.array([1.])),
-    #                   12: (23.421262894121732, np.array([1.]))},
-    #  '20-10208_1_1': {4: (32.8261577021278, np.array([0.77401521])), 5: (32.8261577021278, np.array([0.88811016])),
-    #                   6: (30.017232888181343, np.array([0.95620637])), 7: (29.718873244854002, np.array([1.])),
-    #                   8: (27.041735804577357, np.array([1.])), 9: (24.22816739972193, np.array([1.])),
-    #                   10: (32.7839406124707, np.array([1.])), 11: (22.7806770457251, np.array([1.]))},
-    #  '20-10287_1_1': {4: (26.060669846838703, np.array([0.79438625])), 5: (26.060669846838703, np.array([0.89946043])),
-    #                   6: (17.7046774250957, np.array([1.])), 7: (23.786757846434462, np.array([1.])),
-    #                   8: (18.83586999763443, np.array([1.])), 9: (20.03089808123318, np.array([1.])),
-    #                   10: (24.290857887228835, np.array([1.])), 11: (35.556445744241785, np.array([1.]))},
-    #  '20-10300_1_7': {4: (59.04037343000895, np.array([0.76009719])), 5: (48.90381265651536, np.array([0.8820201])),
-    #                   6: (40.41024205752488, np.array([0.98246825])), 7: (40.83532824577922, np.array([1.])),
-    #                   8: (36.0526250103764, np.array([1.])), 9: (45.98084542622942, np.array([1.])),
-    #                   10: (41.25158630558168, np.array([1.])), 11: (56.6665008983149, np.array([1.]))},
-    #  '20-10303_1_8': {4: (27.658781180164173, np.array([0.79501732])), 5: (14.746698384038085, np.array([0.95960901])),
-    #                   6: (13.031926136308561, np.array([1.])), 7: (12.211346271997146, np.array([1.])),
-    #                   8: (13.59489738909305, np.array([1.])), 9: (13.942841150863677, np.array([1.])),
-    #                   10: (14.870767344526005, np.array([1.])), 11: (17.068955300489037, np.array([1.])),
-    #                   12: (19.44741386963799, np.array([1.])), 13: (10.593811423926242, np.array([1.]))},
-    #  '20-10313_1_5': {4: (31.98050315005507, np.array([1.])), 5: (37.00078064807614, np.array([1.])),
-    #                   6: (27.10710758663553, np.array([1.])), 7: (48.05856980693352, np.array([1.]))},
-    #  '20-10313_3_2': {4: (29.760199896221707, np.array([0.74114443])), 5: (30.963666400345453, np.array([0.91128135])),
-    #                   6: (35.520238583189766, np.array([0.99006779])), 7: (40.54331733152044, np.array([1.])),
-    #                   8: (32.62084525470095, np.array([1.])), 9: (38.902980907438796, np.array([1.])),
-    #                   10: (57.13341284292623, np.array([1.])), 11: (36.505054642476125, np.array([1.]))}}
-
-    # ******* best point out trial ********
-    # tri_data_dict = {'17-8750_2_10': {4: (8.482973832588268, np.array([0.90462975])), 5: (7.509050875069197, np.array([0.9548438])), 6: (8.482973832588268, np.array([0.98076832])), 7: (8.482973832588268, np.array([1.])), 8: (8.482973832588268, np.array([1.])), 9: (7.810697721108619, np.array([1.]))}, '17-9612_1_8': {4: (23.549268509600665, np.array([0.69941711])), 5: (28.077344570071062, np.array([0.81000723])), 6: (28.077344570071062, np.array([0.91439682])), 7: (16.324555867170137, np.array([0.96499244])), 8: (16.324555867170137, np.array([0.97828497])), 9: (16.324555867170137, np.array([0.98658425])), 10: (16.324555867170137, np.array([0.99274814])), 11: (7.127328852245127, np.array([0.9976953])), 12: (7.127328852245127, np.array([1.]))}, '20-10017_1_1': {4: (25.157283018817722, np.array([0.82872286])), 5: (27.33536577809462, np.array([0.9016647])), 6: (27.33536577809462, np.array([0.96378935])), 7: (27.33536577809462, np.array([1.])), 8: (27.33536577809462, np.array([1.])), 9: (27.33536577809462, np.array([1.])), 10: (26.11300229557859, np.array([1.])), 11: (26.11300229557859, np.array([1.]))}, '20-10023_2_10': {4: (32.53872724110683, np.array([0.66445652])), 5: (32.53872724110683, np.array([0.82277207])), 6: (32.53872724110683, np.array([0.91131877])), 7: (17.990929169331796, np.array([0.99602629])), 8: (19.082291524768028, np.array([1.])), 9: (22.55273627142163, np.array([1.])), 10: (5.374000519376838, np.array([1.]))}, '20-10023_2_5': {5: (41.01576016326157, np.array([0.88718867])), 6: (41.01576016326157, np.array([0.95869799])), 7: (41.01576016326157, np.array([0.99210916])), 8: (8.88826865223327, np.array([0.99809361])), 9: (18.896790687178846, np.array([1.])), 10: (33.04779356386894, np.array([1.])), 11: (11.100658566280925, np.array([1.]))}, '20-10040_1_1': {5: (7.932877277344993, np.array([0.8750629])), 6: (7.932877277344993, np.array([0.93940333])), 7: (7.932877277344993, np.array([0.97152163])), 8: (9.48430939136987, np.array([0.99281344])), 9: (7.074295004527593, np.array([1.])), 10: (7.074295004527593, np.array([1.])), 11: (12.4583753931637, np.array([1.]))}, '20-10043_1_1': {4: (9.067647005823506, np.array([0.7894286])), 5: (8.82546819658235, np.array([0.93355799])), 6: (8.82546819658235, np.array([0.95902296])), 7: (15.680844648451952, np.array([0.98114772])), 8: (5.374838498865606, np.array([0.99663517])), 9: (5.374838498865606, np.array([1.])), 10: (9.672412085697784, np.array([1.])), 11: (10.749676997731239, np.array([1.]))}, '20-10103_1_1': {4: (28.243079667268066, np.array([0.82172546])), 5: (30.929060782542642, np.array([0.99756754])), 6: (21.879221331438597, np.array([1.])), 7: (22.87789692687456, np.array([1.])), 8: (20.512032847519006, np.array([1.])), 9: (23.36454075985639, np.array([1.])), 10: (37.549329216794504, np.array([1.]))}, '20-10105_1_1': {4: (57.46999666350188, np.array([0.91526374])), 5: (57.46999666350188, np.array([0.97216685])), 6: (57.46999666350188, np.array([1.])), 7: (64.01728840645804, np.array([1.])), 8: (34.43314952693386, np.array([1.])), 9: (23.024291016670677, np.array([1.])), 10: (15.738655546381645, np.array([1.]))}, '20-10147_1_1': {4: (37.00858789346944, np.array([1.])), 5: (44.518716888610165, np.array([1.])), 6: (40.97712516150624, np.array([1.])), 7: (7.001718865912546, np.array([1.]))}, '20-10148_1_1': {4: (4.028982523019562, np.array([0.73330697])), 5: (4.028982523019562, np.array([0.80274007])), 6: (4.269976600731851, np.array([0.87158508])), 7: (4.269976600731851, np.array([0.90813354])), 8: (4.269976600731851, np.array([0.94178661])), 9: (9.901800331812879, np.array([0.97196006])), 10: (6.134197879432555, np.array([0.9955288])), 11: (6.134197879432555, np.array([1.])), 12: (3.2634286200023594, np.array([1.])), 13: (3.2634286200023594, np.array([1.]))}, '20-10169_1_1': {4: (55.45894723948463, np.array([0.85697408])), 5: (36.33920701070467, np.array([0.99156116])), 6: (12.531087831680306, np.array([1.])), 7: (33.86954102588526, np.array([1.])), 8: (19.920644663612496, np.array([1.])), 9: (29.529790964416655, np.array([1.])), 10: (29.529790964416655, np.array([1.]))}, '20-10170_1_1': {4: (41.39914116124727, np.array([0.71225354])), 5: (41.39914116124727, np.array([0.85379493])), 6: (41.39914116124727, np.array([0.9471753])), 7: (41.39914116124727, np.array([0.98277889])), 8: (41.39914116124727, np.array([1.])), 9: (41.39914116124727, np.array([1.])), 10: (44.12734098291245, np.array([1.])), 11: (32.93765153876173, np.array([1.]))}, '20-10177_1_6': {4: (25.31760062900212, np.array([0.69944925])), 5: (25.31760062900212, np.array([0.95623382])), 6: (15.855313732376539, np.array([0.9974134])), 7: (15.855313732376539, np.array([1.])), 8: (9.927559678893346, np.array([1.])), 9: (9.927559678893346, np.array([1.])), 10: (4.248017162287008, np.array([1.]))}, '20-10179_1_9': {4: (38.477987935383865, np.array([0.76253275])), 5: (13.186693629901685, np.array([0.87187045])), 6: (12.982894729433587, np.array([0.93550289])), 7: (12.982894729433587, np.array([0.97060773])), 8: (12.982894729433587, np.array([1.])), 9: (15.347819244295035, np.array([1.])), 10: (15.670212364724204, np.array([1.])), 11: (12.97005097222915, np.array([1.]))}, '20-10208_1_1': {4: (3.4513225890965478, np.array([0.77401521])), 5: (3.4513225890965478, np.array([0.88811016])), 6: (9.462065061764152, np.array([0.95620637])), 7: (9.870939020063712, np.array([1.])), 8: (10.255801718239724, np.array([1.])), 9: (12.020770740735019, np.array([1.])), 10: (12.020770740735019, np.array([1.]))}, '20-10287_1_1': {4: (8.174129281995103, np.array([0.79438625])), 5: (8.174129281995103, np.array([0.89946043])), 6: (21.943807218280423, np.array([1.])), 7: (13.96391752673201, np.array([1.])), 8: (20.202322882189346, np.array([1.])), 9: (17.976807165566893, np.array([1.])), 10: (13.025270030215886, np.array([1.]))}, '20-10300_1_7': {6: (22.757028796525763, np.array([0.98246825])), 7: (8.829331387029535, np.array([1.])), 8: (23.105894478377213, np.array([1.])), 9: (25.836671712848467, np.array([1.])), 10: (25.836671712848467, np.array([1.]))}, '20-10303_1_8': {4: (29.55660226301128, np.array([0.79501732])), 5: (10.898708596971339, np.array([0.95960901])), 6: (12.932585322425483, np.array([1.])), 7: (12.932585322425483, np.array([1.])), 8: (18.264521273054164, np.array([1.])), 9: (20.224730622133364, np.array([1.])), 10: (18.957339026084217, np.array([1.])), 11: (18.957339026084217, np.array([1.])), 12: (16.850332683537292, np.array([1.]))}, '20-10313_1_5': {4: (2.2160391234793853, np.array([1.])), 5: (15.929665588671398, np.array([1.])), 6: (13.467364409188802, np.array([1.]))}, '20-10313_3_2': {4: (7.273983048976076, np.array([0.74114443])), 5: (7.273983048976076, np.array([0.91128135])), 6: (22.964148373836466, np.array([0.99006779])), 7: (22.964148373836466, np.array([1.])), 8: (13.559010747738515, np.array([1.])), 9: (13.559010747738515, np.array([1.])), 10: (13.559010747738515, np.array([1.]))}}
-    #
-    # rigid_data_dict = {'17-8750_2_10': {4: 12.721734269721777, 5: 11.070827834238749, 6: 10.076476579162401, 7: 10.408592224724059, 8: 11.513341884619084, 9: 9.193073651728852}, '17-9612_1_8': {4: 17.11144805718279, 5: 13.501362339487828, 6: 23.383900409197768, 7: 20.61034829060198, 8: 21.528195609933285, 9: 16.0264229815798, 10: 17.642114918806755, 11: 16.801384010438895, 12: 14.43092913686377}, '20-10017_1_1': {4: 15.239691665891675, 5: 17.964763358517107, 6: 16.78377150733384, 7: 5.494377489371948, 8: 4.969125537579648, 9: 4.497727732713275, 10: 5.66238619814203, 11: 6.554935846730751}, '20-10023_2_10': {4: 20.25830308043308, 5: 21.715811570249553, 6: 16.606622101063724, 7: 11.003452055537968, 8: 6.640399097580669, 9: 8.26007508903743, 10: 6.747764617031562}, '20-10023_2_5': {5: 23.003522954358246, 6: 23.88127837241009, 7: 20.013951366290456, 8: 18.476635787585572, 9: 19.714563118152153, 10: 20.8369426860813, 11: 18.212075013144357}, '20-10040_1_1': {5: 10.297986486689622, 6: 8.79831107281684, 7: 7.429270232616335, 8: 7.2789239604464315, 9: 5.380825877844231, 10: 6.418956705014951, 11: 6.517144875101049}, '20-10043_1_1': {4: 6.703102124518803, 5: 6.558888581327318, 6: 7.251147338127791, 7: 9.761792350878913, 8: 6.873970522529702, 9: 3.997391504772334, 10: 3.771181743405897, 11: 2.3880126559216106}, '20-10103_1_1': {4: 22.281884440057798, 5: 24.548443645141013, 6: 19.1856355628361, 7: 21.157461863436122, 8: 18.50657601932264, 9: 17.760964601630914, 10: 21.300527128274616}, '20-10105_1_1': {4: 51.457531876586785, 5: 99.07829521872729, 6: 100.7370300443009, 7: 102.44408640887245, 8: 92.7145259160316, 9: 29.60457988645289, 10: 29.955589859687098}, '20-10147_1_1': {4: 25.355374182461638, 5: 11.935200482896843, 6: 6.392162637737383, 7: 5.062410954439418}, '20-10148_1_1': {4: 5.394834961781895, 5: 4.952937865534796, 6: 3.3965368544303653, 7: 9.115580076828355, 8: 9.9584474381366, 9: 8.528366059505952, 10: 8.291674593159716, 11: 7.900787719257342, 12: 7.535921519686023, 13: 6.323185868659116}, '20-10169_1_1': {4: 34.399348182236295, 5: 47.96830891938331, 6: 33.11521563991246, 7: 29.605828024404534, 8: 30.439463789465847, 9: 36.63637867258834, 10: 44.37991069000126}, '20-10170_1_1': {4: 26.983227044373802, 5: 13.922206541675, 6: 18.788129915198173, 7: 13.608345165753242, 8: 12.697823411345716, 9: 13.371485075863541, 10: 19.20899870834208, 11: 20.708188127712226}, '20-10177_1_6': {4: 22.538028269188587, 5: 12.2640619448283, 6: 1.6812153775815408, 7: 6.230120084817792, 8: 2.391594924010874, 9: 3.9829509023858005, 10: 5.857778265038015}, '20-10179_1_9': {4: 18.885945126743522, 5: 13.379121758801736, 6: 11.013175946782871, 7: 15.502393752472349, 8: 8.821091514919317, 9: 5.134094557559792, 10: 2.068119480087959, 11: 2.3699545054585607}, '20-10208_1_1': {4: 12.670199949831705, 5: 7.4711332858967845, 6: 16.417873239402187, 7: 15.710689668897917, 8: 17.0677549577134, 9: 18.08339544150134, 10: 12.859737608365718}, '20-10287_1_1': {4: 10.531530894069274, 5: 3.837758895352743, 6: 10.594994743163932, 7: 7.05650266753589, 8: 5.9984858618350145, 9: 5.108982403573714, 10: 4.538389360072342}, '20-10300_1_7': {6: 7.240644946827002, 7: 7.005826234178222, 8: 10.009617687791895, 9: 8.074011492808076, 10: 13.915000132572102}, '20-10303_1_8': {4: 21.808649184184482, 5: 14.585461912334958, 6: 10.670441415474075, 7: 7.045947133694094, 8: 7.255369927297619, 9: 10.078206475999968, 10: 8.634003215842384, 11: 7.72424729069351, 12: 6.267740053787436}, '20-10313_1_5': {4: 7.211252939303034, 5: 5.445190384539975, 6: 9.527360363591814}, '20-10313_3_2': {4: 11.065788334492328, 5: 4.732540090503264, 6: 13.427283135547587, 7: 11.982582515885529, 8: 10.151396904312762, 9: 10.339237587545693, 10: 7.65672567152606}}
-
-    # ******* different outer groups trial ********
-    # tri_data_dict_new = {'17-8750_2_10': {5: 21.207000366158177, 6: 20.37965688318297, 7: 19.54238162387375}, '17-9612_1_8': {5: 27.868081405993003, 6: 25.969427280490653, 7: 24.80287881058371, 8: 24.89004727958407, 9: 25.150740762227905, 10: 23.908999722653203, 11: 22.901155785853696, 12: 21.76150063275847}, '20-10017_1_1': {5: 21.641835118515093, 6: 20.666752939001416, 7: 21.875917836996578}, '20-10023_2_10': {5: 24.043952626039843, 6: 23.279615775515623, 7: 22.271136237349985, 8: 21.151967323679216}, '20-10023_2_5': {5: 20.990631382068763, 6: 20.94074224948207, 7: 20.643225061643154, 8: 20.138567649748527, 9: 20.49484135390564}, '20-10040_1_1': {5: 12.93068444324545, 6: 14.104935693365878, 7: 15.300098992603091, 8: 16.8444605086517, 9: 19.285320533884846}, '20-10043_1_1': {5: 13.12813536056378, 6: 11.815496180874188, 7: 11.06396503764992, 8: 10.764120659439493, 9: 10.78508884035425}, '20-10103_1_1': {5: 27.933365792212047, 6: 29.97411099477561}, '20-10105_1_1': {5: 65.00167902628029, 6: 65.00167902628029}, '20-10148_1_1': {5: 13.922309110307959, 6: 16.52946566203595, 7: 17.540496995587425, 8: 18.173562081730857, 9: 22.06302570027848, 10: 25.69398406319484, 11: 32.53456384988357}, '20-10169_1_1': {5: 37.156304500156494, 6: 34.9659104089476}, '20-10170_1_1': {5: 61.58589393055763, 6: 55.88148940865083, 7: 52.50819746430312, 8: 51.46601809751449}, '20-10177_1_6': {5: 22.154022887831033, 6: 20.052934041465946, 7: 20.102456721165613}, '20-10179_1_9': {5: 41.520015241989455, 6: 37.99417417635113, 7: 30.058317847855427, 8: 17.712446256502336}, '20-10208_1_1': {5: 31.753433155923243, 6: 30.52796785657144, 7: 29.718873244854002}, '20-10287_1_1': {5: 21.8826736359672, 6: 17.7046774250957}, '20-10300_1_7': {5: 49.86352068206122, 6: 45.18980627794539, 7: 40.83532824577922}, '20-10303_1_8': {5: 16.168498882040257, 6: 13.031926136308561}, '20-10313_3_2': {5: 33.350064446720786, 6: 36.56472257658334, 7: 40.54331733152044}}
-    # tri_data_dict = {'17-8750_2_10': {5: (21.207000366158177, 0.9548438), 6: (20.37965688318297, 0.98076832), 7: (19.54238162387375, 1.0)}, '17-9612_1_8': {5: (27.868081405993003, 0.81000723), 6: (25.969427280490653, 0.91439682), 7: (24.80287881058371, 0.96499244), 8: (24.89004727958407, 0.97828497), 9: (25.150740762227905, 0.98658425), 10: (23.908999722653203, 0.99274814), 11: (22.901155785853696, 0.9976953), 12: (21.76150063275847, 1.0)}, '20-10017_1_1': {5: (21.641835118515093, 0.9016647), 6: (20.666752939001416, 0.96378935), 7: (21.875917836996578, 1.0)}, '20-10023_2_10': {5: (24.043952626039843, 0.82277207), 6: (23.279615775515623, 0.91131877), 7: (22.271136237349985, 0.99602629), 8: (21.151967323679216, 1.0)}, '20-10023_2_5': {5: (20.990631382068763, 0.88718867), 6: (20.94074224948207, 0.95869799), 7: (20.643225061643154, 0.99210916), 8: (20.138567649748527, 0.99809361), 9: (20.49484135390564, 1.0)}, '20-10040_1_1': {5: (12.93068444324545, 0.8750629), 6: (14.104935693365878, 0.93940333), 7: (15.300098992603091, 0.97152163), 8: (16.8444605086517, 0.99281344), 9: (19.285320533884846, 1.0)}, '20-10043_1_1': {5: (13.12813536056378, 0.93355799), 6: (11.815496180874188, 0.95902296), 7: (11.06396503764992, 0.98114772), 8: (10.764120659439493, 0.99663517), 9: (10.78508884035425, 1.0)}, '20-10103_1_1': {5: (27.933365792212047, 0.99756754), 6: (29.97411099477561, 1.0)}, '20-10105_1_1': {5: (65.00167902628029, 0.97216685), 6: (65.00167902628029, 1.0)}, '20-10148_1_1': {5: (13.922309110307959, 0.80274007), 6: (16.52946566203595, 0.87158508), 7: (17.540496995587425, 0.90813354), 8: (18.173562081730857, 0.94178661), 9: (22.06302570027848, 0.97196006), 10: (25.69398406319484, 0.9955288), 11: (32.53456384988357, 1.0)}, '20-10169_1_1': {5: (37.156304500156494, 0.99156116), 6: (34.9659104089476, 1.0)}, '20-10170_1_1': {5: (61.58589393055763, 0.85379493), 6: (55.88148940865083, 0.9471753), 7: (52.50819746430312, 0.98277889), 8: (51.46601809751449, 1.0)}, '20-10177_1_6': {5: (22.154022887831033, 0.95623382), 6: (20.052934041465946, 0.9974134), 7: (20.102456721165613, 1.0)}, '20-10179_1_9': {5: (41.520015241989455, 0.87187045), 6: (37.99417417635113, 0.93550289), 7: (30.058317847855427, 0.97060773), 8: (17.712446256502336, 1.0)}, '20-10208_1_1': {5: (31.753433155923243, 0.88811016), 6: (30.52796785657144, 0.95620637), 7: (29.718873244854002, 1.0)}, '20-10287_1_1': {5: (21.8826736359672, 0.89946043), 6: (17.7046774250957, 1.0)}, '20-10300_1_7': {5: (49.86352068206122, 0.95), 6: (45.18980627794539, 0.98246825), 7: (40.83532824577922, 1.0)}, '20-10303_1_8': {5: (16.168498882040257, 0.95960901), 6: (13.031926136308561, 1.0)}, '20-10313_3_2': {5: (33.350064446720786, 0.91128135), 6: (36.56472257658334, 0.99006779), 7: (40.54331733152044, 1.0)}}
-    # rigid_data_dict = {'17-8750_2_10': {5: 27.944598888869212, 6: 27.221445072157437, 7: 26.46438384859622}, '17-9612_1_8': {5: 17.50470602002357, 6: 15.757951038526972, 7: 14.611194802040174, 8: 13.960459203001742, 9: 15.059469772734806, 10: 16.134665605566877, 11: 17.289049820199484, 12: 17.039849918955024}, '20-10017_1_1': {5: 15.422209055256403, 6: 13.610639170713108, 7: 11.592838879730648}, '20-10023_2_10': {5: 21.202007728132582, 6: 19.59782939229137, 7: 18.477242148293612, 8: 17.559525538902413}, '20-10023_2_5': {5: 48.25727889810376, 6: 45.11642479592547, 7: 43.7200047094129, 8: 43.28354929487479, 9: 42.9693969322507}, '20-10040_1_1': {5: 14.37438278571795, 6: 13.515307350578258, 7: 12.799167024451936, 8: 12.304489395428533, 9: 12.092245075713397}, '20-10043_1_1': {5: 39.19022412165589, 6: 36.530705354509635, 7: 14.454591121567608, 8: 14.015912336593384, 9: 13.588530862339397}, '20-10103_1_1': {5: 34.34523999630902, 6: 34.32045185795319}, '20-10105_1_1': {5: 85.53286244177494, 6: 67.61958612238651}, '20-10148_1_1': {5: 14.389147733763597, 6: 15.963829309217278, 7: 16.781802566594905, 8: 14.837597244105439, 9: 18.00236686887211, 10: 17.603195879373764, 11: 17.669513132258146}, '20-10169_1_1': {5: 53.152247439320846, 6: 49.942480628475614}, '20-10170_1_1': {5: 58.6337115686799, 6: 53.94725891400199, 7: 51.00744854176924, 8: 49.15133090859747}, '20-10177_1_6': {5: 23.921652468487675, 6: 22.56798790376132, 7: 22.593519738877806}, '20-10179_1_9': {5: 53.679224256534454, 6: 41.84324577749246, 7: 26.85863884159587, 8: 25.231495194070458}, '20-10208_1_1': {5: 43.45719432406665, 6: 41.09200015995527, 7: 39.79646888058684}, '20-10287_1_1': {5: 23.65391491408167, 6: 24.291307970986736}, '20-10300_1_7': {5: 46.82824150093679, 6: 43.62059996845187, 7: 40.66867517475093}, '20-10303_1_8': {5: 25.411226273121947, 6: 23.718134979636613}, '20-10313_3_2': {5: 37.57502277832326, 6: 38.52272815565134, 7: 38.07910013916895}}
-    #
-    # show_mean_dist_area_prop(tri_data_dict=tri_data_dict, rigid_data_dict=rigid_data_dict, avg_dirs=True)
