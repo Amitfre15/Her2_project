@@ -539,6 +539,21 @@ def plot_impact_analysis(y_true, local_scores, chosen_t=[0.6], n_boot=1000, c_di
         npv_l.append(npv[0])
         impact_l.append(impact[0])
     
+    # nearest_lower_threshold_to_chosen index
+    nlttc = max([i for i, t in enumerate(thresholds) if t <= chosen_t[0]])
+
+    # add the point for the chosen threshold if it's not already in the list
+    if chosen_t[0] not in thresholds:
+        sens, spec, ppv, npv, impact = compute_clinical_metrics(y_true, local_scores, thresholds=chosen_t)
+        # insert the chosen threshold and corresponding metrics at the nlttc index + 1 (to maintain order)
+        thresholds.insert(nlttc + 1, chosen_t[0])
+        sens_l.insert(nlttc + 1, sens[0])
+        spec_l.insert(nlttc + 1, spec[0])
+        ppv_l.insert(nlttc + 1, ppv[0])
+        npv_l.insert(nlttc + 1, npv[0])
+        impact_l.insert(nlttc + 1, impact[0])
+    
+    
     # Bootstrap CI (only for local model to keep plot clean)
     ci_l = bootstrap_metrics(y_true, local_scores, thresholds=thresholds, n_boot=n_boot)
 
@@ -546,15 +561,19 @@ def plot_impact_analysis(y_true, local_scores, chosen_t=[0.6], n_boot=1000, c_di
     # --- LOCAL MODEL (solid + CI) ---
     plt.plot(impact_l, spec_l, color=c_dict["Specificity"], linewidth=2, label="Specificity")
     plt.fill_between(impact_l, ci_l["spec"][0], ci_l["spec"][1], color=c_dict["Specificity"], alpha=0.1)
+    print(f"Specificity at chosen_t = {chosen_t[0]}: {spec_l[thresholds.index(chosen_t[0])]} (95% CI: [{ci_l['spec'][0][thresholds.index(chosen_t[0])]}, {ci_l['spec'][1][thresholds.index(chosen_t[0])]}])")
 
     plt.plot(impact_l, sens_l, color=c_dict["Sensitivity"], linewidth=2, label="Sensitivity")
     plt.fill_between(impact_l, ci_l["sens"][0], ci_l["sens"][1], color=c_dict["Sensitivity"], alpha=0.1)
+    print(f"Sensitivity at chosen_t = {chosen_t[0]}: {sens_l[thresholds.index(chosen_t[0])]} (95% CI: [{ci_l['sens'][0][thresholds.index(chosen_t[0])]}, {ci_l['sens'][1][thresholds.index(chosen_t[0])]}])")
 
     plt.plot(impact_l, ppv_l, color=c_dict["PPV"], linewidth=2, label="PPV")
     plt.fill_between(impact_l, ci_l["ppv"][0], ci_l["ppv"][1], color=c_dict["PPV"], alpha=0.1)
+    print(f"PPV at chosen_t = {chosen_t[0]}: {ppv_l[thresholds.index(chosen_t[0])]} (95% CI: [{ci_l['ppv'][0][thresholds.index(chosen_t[0])]}, {ci_l['ppv'][1][thresholds.index(chosen_t[0])]}])")
 
     plt.plot(impact_l, npv_l, color=c_dict["NPV"], linewidth=2, label="NPV")
     plt.fill_between(impact_l, ci_l["npv"][0], ci_l["npv"][1], color=c_dict["NPV"], alpha=0.1)
+    print(f"NPV at chosen_t = {chosen_t[0]}: {npv_l[thresholds.index(chosen_t[0])]} (95% CI: [{ci_l['npv'][0][thresholds.index(chosen_t[0])]}, {ci_l['npv'][1][thresholds.index(chosen_t[0])]}])")
 
     for t in chosen_t:
         point = get_point(y_true, local_scores, chosen_t=t) # chosen_t
@@ -571,9 +590,8 @@ def plot_impact_analysis(y_true, local_scores, chosen_t=[0.6], n_boot=1000, c_di
         plt.scatter([impact], [npv], color=c_dict["NPV"])
 
         plt.text(impact + 0.015, spec + 0.01, f"{spec:.2f}", color=c_dict["Specificity"], fontsize=13) # chosen_t + 0.12, spec + 0.01
-        # plt.annotate(f"{spec:.3f}", xy=(impact, spec), xytext=(0.015, 0.01), textcoords="offset points", bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="gray", lw=0.5, alpha=0.8) # Masks the line)
         plt.text(impact - 0.09, sens - 0.01, f"{sens:.2f}", color=c_dict["Sensitivity"], fontsize=13) # sens - 0.03
-        plt.text(impact - 0.09, ppv + 0.04, f"{ppv:.2f}", color=c_dict["PPV"], fontsize=13) # ppv - 0.1 , + 0.06
+        plt.text(impact - 0.13, ppv + 0.01, f"{ppv:.2f}", color=c_dict["PPV"], fontsize=13) # ppv - 0.1 , + 0.06
         plt.text(impact - 0.09, npv - 0.09, f"{npv:.2f}", color=c_dict["NPV"], fontsize=13)
 
     # -----------------------------

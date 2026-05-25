@@ -1089,7 +1089,9 @@ def train_one_epoch(train_loader, model, fp16_scaler, optimizer, loss_fn, epoch,
                     window_logits.append(wndw_logits)
                 window_logits = torch.stack(window_logits).view(len_windows, -1)
             elif args.paired_training_mw:
-                if args.paired_mw_w_cancer:
+                if args.malig_baseline:
+                    logits = model(ihc_images, img_coords)
+                elif args.paired_mw_w_cancer:
                     logits = model(images, img_coords, ihc_images, modality_weights=True, cancer_weights=True, tile_cancer_probs=cancer_prob)
                 elif args.paired_mw_cancer_scale:
                     logits = model(images, img_coords, ihc_images, modality_weights=True, tile_cancer_probs=cancer_prob, cancer_scale=True)
@@ -1675,7 +1677,9 @@ def evaluate(loader, model, fp16_scaler, loss_fn, epoch, args, save_embed=False)
                             window_logits.append(wndw_logits)
                         window_logits = torch.stack(window_logits).view(len_windows, -1)
                     elif args.paired_training_mw:
-                        if args.paired_mw_w_cancer:
+                        if args.malig_baseline:
+                            logits = model(ihc_images, img_coords)
+                        elif args.paired_mw_w_cancer:
                             logits, embed = model(images, img_coords, ihc_images, modality_weights=True, cancer_weights=True, tile_cancer_probs=cancer_prob, return_embed=True)
                         elif args.paired_mw_cancer_scale:
                             logits, embed = model(images, img_coords, ihc_images, modality_weights=True, cancer_scale=True, tile_cancer_probs=cancer_prob, return_embed=True)
@@ -1780,7 +1784,9 @@ def evaluate(loader, model, fp16_scaler, loss_fn, epoch, args, save_embed=False)
                         window_logits = torch.stack(window_logits).view(len_windows, -1)
                         logits = window_logits.mean(dim=0) # for evaluation records
                     elif args.paired_training_mw:
-                        if args.paired_mw_w_cancer:
+                        if args.malig_baseline:
+                            logits = model(ihc_images, img_coords)
+                        elif args.paired_mw_w_cancer:
                             logits = model(images, img_coords, ihc_images, modality_weights=True, cancer_weights=True, tile_cancer_probs=cancer_prob)
                         elif args.paired_mw_cancer_scale:
                             logits = model(images, img_coords, ihc_images, modality_weights=True, cancer_scale=True, tile_cancer_probs=cancer_prob)

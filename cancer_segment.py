@@ -128,6 +128,7 @@ def parse_args():
     parser.add_argument('-seg_y', '--seg_y_labels', action='store_true', default=False, help='save HER2 contribution (y) pseudo labels map')
     parser.add_argument('-seg_y_pred', '--seg_y_predictions', action='store_true', default=False, help='save HER2 contribution (y) prediction map')
     parser.add_argument('-seg_ot', '--seg_only_tumor', action='store_true', default=False, help='save only tumor tiles in HER2 contribution (y) prediction map')
+    parser.add_argument('-amc', '--all_models_cancer', action='store_true', default=False, help='Only tiles classified as tumor by all cancer models will be considered tumor')
     parser.add_argument('-efy_map', '--extract_tile_y_from_y_map', action='store_true', default=False, help='extract tile y from y map')
     parser.add_argument('-etfcm', '--extract_tumor_indices_from_cancer_map', action='store_true', default=False, help='extract tumor indices from cancer map')
     parser.add_argument('-save_tifsm', '--save_tumor_indices_from_seg_map', action='store_true', default=False, help='save tumor tile indices from segmentation map')
@@ -422,7 +423,7 @@ def load_tumor_indices(args, slide_ctx):
         y_file = os.path.join(slide_ctx.paths.tile_y_folder, tile_y_npy)
         slide_ctx.tile_y = np.load(y_file).flatten() if os.path.exists(y_file) else None
     elif not args.her2_annotations:
-        slide_ctx.tumor_indices = np.load(ti).astype(int) if os.path.exists(ti) else None
+        slide_ctx.tumor_indices = np.load(slide_ctx.paths.ti).astype(int) if os.path.exists(slide_ctx.paths.ti) else None
     
     if args.save_ensemble_tumor_indices:
         save_ensemble_tumor_indices(args, slide_ctx)
@@ -1173,11 +1174,15 @@ def save_ensemble_tumor_indices(args: argparse.Namespace, slide_ctx: SlideContex
                 else:
                     print(f"cancer_prob file {cp_path} does not exist. Skipping...")
         cp_npys = np.array(cp_npys)
-        # tiles where all models predict cancer (prob >= 0.5) should hold the mean, otherwise set to 0
-        all_models_predict_cancer = np.all(cp_npys >= 0.5, axis=0)
 
-        # ensemble_cancer_prob = np.mean(cp_npys, axis=0)
-        ensemble_cancer_prob = np.where(all_models_predict_cancer, np.mean(cp_npys, axis=0), 0)
+        ensemble_str = ''
+        if args.all_models_cancer:
+            # tiles where all models predict cancer (prob >= 0.5) should hold the mean, otherwise set to 0
+            all_models_predict_cancer = np.all(cp_npys >= 0.5, axis=0)
+            ensemble_cancer_prob = np.where(all_models_predict_cancer, np.mean(cp_npys, axis=0), 0)
+        else:
+            ensemble_cancer_prob = np.mean(cp_npys, axis=0)
+            ensemble_str = 'Mean'
 
         tile_pred_segment = np.full((args.seg_thumb_height, args.seg_thumb_width), fill_value=SEGMENT_UNKNOWN, dtype=float)
         for idx, tile_name in tqdm(enumerate(slide_ctx.valid_tiles), desc=f"Processing tiles for {slide_ctx.slide_name}"):
@@ -1187,7 +1192,7 @@ def save_ensemble_tumor_indices(args: argparse.Namespace, slide_ctx: SlideContex
             if ensemble_cancer_prob[idx] >= 0.5:
                 tumor_indices.append(idx)
         
-        save_segmented_tiles(segment_map=tile_pred_segment, segment_dir=slide_ctx.paths.segment_dir, save_name=f'Ensemble Binary Local Cancer Probability (MPP={args.source_mpp} GigaPath features trained model)',
+        save_segmented_tiles(segment_map=tile_pred_segment, segment_dir=slide_ctx.paths.segment_dir, save_name=f'Ensemble {ensemble_str} Binary Local Cancer Probability (MPP={args.source_mpp} GigaPath features trained model)',
                             value_label='Cancer Probability')
 
         if len(tumor_indices) == 0:

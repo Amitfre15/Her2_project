@@ -65,6 +65,7 @@ def get_finetune_params():
     parser.add_argument('--paired_mw_w_cancer',action='store_true', default=False, help='Use paired H&E and IHC matched tiles with cancer probabilities for training')
     parser.add_argument('--paired_mw_cancer_scale',action='store_true', default=False, help='Use paired H&E and IHC matched tiles with cancer probabilities as features scale for training')
     parser.add_argument('--malig_paired_mw',action='store_true', default=False, help='Use paired H&E and IHC matched malignant tiles for training')
+    parser.add_argument('--malig_baseline' ,action='store_true', default=False, help='Use IHC matched malignant tiles for baseline training')
     parser.add_argument('--replace_benign_w_zero',action='store_true', default=False, help='Replace benign tiles with zero features for training')
     parser.add_argument('--paired_training_mb',action='store_true', default=False, help='Concat paired H&E and IHC image features for training')
     parser.add_argument('--paired_training_cat_h',action='store_true', default=False, help='Concat paired H&E and IHC slide features for training')

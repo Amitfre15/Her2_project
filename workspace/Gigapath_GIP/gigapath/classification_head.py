@@ -602,7 +602,7 @@ def get_model(**kwargs):
         if kwargs["load_tile_logits"] or kwargs["tile_slide_model"]:
             return model
         return tile_model, model
-    elif kwargs["paired_training_mw"] or kwargs["paired_training_mb"] or kwargs["paired_training_cat_h"]:
+    elif (kwargs["paired_training_mw"] and not kwargs["malig_baseline"]) or kwargs["paired_training_mb"] or kwargs["paired_training_cat_h"]:
         model = PairedClassificationHead(**kwargs)
         print(f'model = PairedClassificationHead')
     elif kwargs["clinical_features"]:
