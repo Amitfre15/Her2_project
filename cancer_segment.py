@@ -161,9 +161,7 @@ def cast_mpp(mpp):
 
 
 def setup_args(args):
-    args.device = torch.device(
-        "cuda" if torch.cuda.is_available() else "cpu"
-    )
+    args.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     args.target_mpp = cast_mpp(args.target_mpp)
     args.source_mpp = cast_mpp(args.source_mpp)
@@ -590,23 +588,13 @@ def compute_y_std(
         }
 
 
-def process_slide(
-    args,
-    slide_ctx,
-    collectors
-):
+def process_slide(args, slide_ctx, collectors):
     get_tile_segment(args, slide_ctx)
-
     load_tumor_indices(args, slide_ctx)
-
     process_y_labels(args, slide_ctx)
-
     process_y_predictions(args, slide_ctx, collectors)
-
     extract_tile_y(args, slide_ctx)
-
     send_extract_tumor_indices_from_cancer_map(args, slide_ctx)
-
     compute_y_std(args, slide_ctx, collectors)
 
 
@@ -1182,7 +1170,7 @@ def save_ensemble_tumor_indices(args: argparse.Namespace, slide_ctx: SlideContex
             ensemble_cancer_prob = np.where(all_models_predict_cancer, np.mean(cp_npys, axis=0), 0)
         else:
             ensemble_cancer_prob = np.mean(cp_npys, axis=0)
-            ensemble_str = 'Mean'
+            ensemble_str = 'Mean '
 
         tile_pred_segment = np.full((args.seg_thumb_height, args.seg_thumb_width), fill_value=SEGMENT_UNKNOWN, dtype=float)
         for idx, tile_name in tqdm(enumerate(slide_ctx.valid_tiles), desc=f"Processing tiles for {slide_ctx.slide_name}"):
@@ -1192,7 +1180,7 @@ def save_ensemble_tumor_indices(args: argparse.Namespace, slide_ctx: SlideContex
             if ensemble_cancer_prob[idx] >= 0.5:
                 tumor_indices.append(idx)
         
-        save_segmented_tiles(segment_map=tile_pred_segment, segment_dir=slide_ctx.paths.segment_dir, save_name=f'Ensemble {ensemble_str} Binary Local Cancer Probability (MPP={args.source_mpp} GigaPath features trained model)',
+        save_segmented_tiles(segment_map=tile_pred_segment, segment_dir=slide_ctx.paths.segment_dir, save_name=f'Ensemble {ensemble_str}Binary Local Cancer Probability (MPP={args.source_mpp} GigaPath features trained model)',
                             value_label='Cancer Probability')
 
         if len(tumor_indices) == 0:
@@ -1361,6 +1349,8 @@ def main():
     slides_df = metadata["slides_df"]
 
     for _, row in tqdm(slides_df.iterrows(), total=len(slides_df)):
+        if '19-14590' not in row['SlideName']:
+            continue
         try:
             slide_ctx = prepare_slide_context(args=args, row=row, paths=paths, metadata=metadata)
             process_slide(args=args, slide_ctx=slide_ctx, collectors=collectors)

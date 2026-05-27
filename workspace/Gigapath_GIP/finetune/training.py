@@ -806,7 +806,7 @@ def train_one_epoch(train_loader, model, fp16_scaler, optimizer, loss_fn, epoch,
     for batch_idx, batch in enumerate(train_loader):
         slide_id = batch['slide_id'][-1] 
 
-        # if batch_idx < 397:
+        # if '19-14590' not in slide_id:
         #     continue
 
         if args.window_training:            
@@ -1678,7 +1678,7 @@ def evaluate(loader, model, fp16_scaler, loss_fn, epoch, args, save_embed=False)
                         window_logits = torch.stack(window_logits).view(len_windows, -1)
                     elif args.paired_training_mw:
                         if args.malig_baseline:
-                            logits = model(ihc_images, img_coords)
+                            logits, embed = model(ihc_images, img_coords, return_embed=True)
                         elif args.paired_mw_w_cancer:
                             logits, embed = model(images, img_coords, ihc_images, modality_weights=True, cancer_weights=True, tile_cancer_probs=cancer_prob, return_embed=True)
                         elif args.paired_mw_cancer_scale:

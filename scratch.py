@@ -163,12 +163,12 @@ def add_clinical_features():
     df.to_csv("workspace/WSI/metadata_csvs/Her2_slides_matched_HE_folds_HE_w_clinical.csv", index=False)
 
 def check_cancer_tiles():
-    he_slide_name = "20-4872_1_1_e"
-    ihc_slide_name = "20-4872_1_1_m"
+    he_slide_name = "19-14590_1_1_e"
+    ihc_slide_name = "19-14590_1_1_n"
     mt_file = f"/SSDStorage/Breast/Carmel/Her2/gigapath_IHC/matching_tiles_mpp0.5/{he_slide_name}/ihc_tiles.npy"
     he_tiles_path = f"/SSDStorage/Breast/Carmel/Her2/gigapath_HE/png_tiles_mpp0.5/{he_slide_name}/"
     ihc_tiles_path = f"/SSDStorage/Breast/Carmel/Her2/gigapath_IHC/png_tiles_mpp0.5/{ihc_slide_name}/"
-    ti_path = f"/SSDStorage/Breast/Carmel/Her2/gigapath_IHC/tumor_indices_from_cancer_map_mpp0.5/{he_slide_name}/tumor_indices3.npy" # local_tumor_indices_ensemble
+    ti_path = f"/SSDStorage/Breast/Carmel/Her2/gigapath_IHC/tumor_indices_from_cancer_map_mpp0.5/{he_slide_name}/local_tumor_indices_ensemble.npy" # local_tumor_indices_ensemble
     matching_tiles = load_npy_file(mt_file)
     tumor_indices = load_npy_file(ti_path)
     he_tiles = np.array(os.listdir(he_tiles_path))
