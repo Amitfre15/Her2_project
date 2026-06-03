@@ -518,7 +518,7 @@ def plot_threshold_analysis(
 
     # plot_impact_analysis(sens_l, spec_l, ppv_l, npv_l, impact_l, ci_l, chosen_t, chosen_t_ind, point, save_dir=save_dir)
 
-def plot_impact_analysis(y_true, local_scores, chosen_t=[0.6], n_boot=1000, high=True, c_dict=None, save_dir=None):
+def plot_impact_analysis(args, y_true, local_scores, c_dict=None):
     # sort local_scores and corresponding y_true by local_scores
     sorted_indices = np.argsort(local_scores)
     local_scores_sorted = local_scores[sorted_indices]
@@ -540,7 +540,7 @@ def plot_impact_analysis(y_true, local_scores, chosen_t=[0.6], n_boot=1000, high
         impact_l.append(impact[0])
 
     # add the point for the chosen threshold if it's not already in the list
-    for t in chosen_t:
+    for t in args.chosen_threshold:
         if t not in thresholds:
             # nearest_lower_threshold_to_chosen index
             nlttc = max([i for i, thr in enumerate(thresholds) if thr <= t])
@@ -554,9 +554,9 @@ def plot_impact_analysis(y_true, local_scores, chosen_t=[0.6], n_boot=1000, high
             npv_l.insert(nlttc + 1, npv[0])
             impact_l.insert(nlttc + 1, impact[0])
     
-    
-    # # Bootstrap CI (only for local model to keep plot clean)
-    # ci_l = bootstrap_metrics(y_true, local_scores, thresholds=thresholds, n_boot=n_boot)
+    if args.metrics_ci:
+        # Bootstrap CI (only for local model to keep plot clean)
+        ci_l = bootstrap_metrics(y_true, local_scores, thresholds=thresholds, n_boot=args.n_boot)
 
     # plot the metrics as a function of impacted patient fraction
     # --- LOCAL MODEL (solid + CI) ---
@@ -564,14 +564,14 @@ def plot_impact_analysis(y_true, local_scores, chosen_t=[0.6], n_boot=1000, high
     # plt.fill_between(impact_l, ci_l["spec"][0], ci_l["spec"][1], color=c_dict["Specificity"], alpha=0.1)
     plt.plot(impact_l, sens_l, color=c_dict["Sensitivity"], linewidth=2, label="Sensitivity")
     # plt.fill_between(impact_l, ci_l["sens"][0], ci_l["sens"][1], color=c_dict["Sensitivity"], alpha=0.1)
-    if high:
+    if args.high_categories:
         plt.plot(impact_l, ppv_l, color=c_dict["PPV"], linewidth=2, label="PPV")
         # plt.fill_between(impact_l, ci_l["ppv"][0], ci_l["ppv"][1], color=c_dict["PPV"], alpha=0.1)
     else:
         plt.plot(impact_l, npv_l, color=c_dict["NPV"], linewidth=2, label="NPV")
         # plt.fill_between(impact_l, ci_l["npv"][0], ci_l["npv"][1], color=c_dict["NPV"], alpha=0.1)
 
-    for idx, t in enumerate(chosen_t):
+    for idx, t in enumerate(args.chosen_threshold):
         point = get_point(y_true, local_scores, chosen_t=t) # chosen_t
         sens, spec, ppv, npv, impact = point
 
@@ -582,21 +582,31 @@ def plot_impact_analysis(y_true, local_scores, chosen_t=[0.6], n_boot=1000, high
         # plt.text(impact + 0.0045, 0.02 - idx * 0.05, f"{impact:.3f}", color="gray", fontsize=13)
 
         plt.scatter([impact], [sens], color=c_dict["Sensitivity"], s=200, alpha=0.2)
-        print(f"Sensitivity at chosen_t = {t}: {sens_l[thresholds.index(t)]}") # (95% CI: [{ci_l['sens'][0][thresholds.index(t)]}, {ci_l['sens'][1][thresholds.index(t)]}])
+        print(f"Sensitivity at chosen_t = {t}: {sens_l[thresholds.index(t)]}")
+        if args.metrics_ci:
+            print(f" (95% CI: [{ci_l['sens'][0][thresholds.index(t)]}, {ci_l['sens'][1][thresholds.index(t)]}])")
         plt.scatter([impact], [spec], color=c_dict["Specificity"], s=200, alpha=0.2)
-        print(f"Specificity at chosen_t = {t}: {spec_l[thresholds.index(t)]}") # (95% CI: [{ci_l['spec'][0][thresholds.index(t)]}, {ci_l['spec'][1][thresholds.index(t)]}])
-        if high:
+        print(f"Specificity at chosen_t = {t}: {spec_l[thresholds.index(t)]}") 
+        if args.metrics_ci:
+            print(f" (95% CI: [{ci_l['spec'][0][thresholds.index(t)]}, {ci_l['spec'][1][thresholds.index(t)]}])")
             
+        if args.high_categories:
             plt.scatter([impact], [ppv], color=c_dict["PPV"], s=200, alpha=0.2)
             # plt.text(impact - 0.09, sens - 0.01, f"{sens:.2f}", color=c_dict["Sensitivity"], fontsize=13) # sens - 0.03
             # plt.text(impact + 0.02, ppv + 0.01, f"{ppv:.2f}", color=c_dict["PPV"], fontsize=13) # ppv - 0.1 , + 0.06
-            print(f"PPV at chosen_t = {t}: {ppv_l[thresholds.index(t)]}") # (95% CI: [{ci_l['ppv'][0][thresholds.index(t)]}, {ci_l['ppv'][1][thresholds.index(t)]}])
         else:
-            
             plt.scatter([impact], [npv], color=c_dict["NPV"], s=200, alpha=0.2)
             # plt.text(impact + 0.015, spec + 0.01, f"{spec:.2f}", color=c_dict["Specificity"], fontsize=13) # chosen_t + 0.12, spec + 0.01
             # plt.text(impact - 0.09, npv - 0.09, f"{npv:.2f}", color=c_dict["NPV"], fontsize=13) 
-            print(f"NPV at chosen_t = {t}: {npv_l[thresholds.index(t)]}") # (95% CI: [{ci_l['npv'][0][thresholds.index(t)]}, {ci_l['npv'][1][thresholds.index(t)]}])
+        
+        print(f"PPV at chosen_t = {t}: {ppv_l[thresholds.index(t)]}") 
+        if args.metrics_ci:
+            print(f" (95% CI: [{ci_l['ppv'][0][thresholds.index(t)]}, {ci_l['ppv'][1][thresholds.index(t)]}])")
+
+        print(f"NPV at chosen_t = {t}: {npv_l[thresholds.index(t)]}") 
+        if args.metrics_ci:
+            print(f" (95% CI: [{ci_l['npv'][0][thresholds.index(t)]}, {ci_l['npv'][1][thresholds.index(t)]}])")
+            
         print("\n")
 
     # -----------------------------
@@ -619,8 +629,8 @@ def plot_impact_analysis(y_true, local_scores, chosen_t=[0.6], n_boot=1000, high
     plt.ylim(0, 1.05)
     plt.tight_layout()
     plt.show()
-    t_str = "_".join([str(t) for t in chosen_t])
-    plt.savefig(os.path.join(save_dir, f"impact_analysis_{t_str}_equal_impact_sampling.png"), dpi=300, bbox_inches='tight') if save_dir else None
+    t_str = "_".join([str(t) for t in args.chosen_threshold])
+    plt.savefig(os.path.join(args.save_dir, f"impact_analysis_{t_str}_equal_impact_sampling.png"), dpi=300, bbox_inches='tight') if args.save_dir else None
     # plt.savefig(os.path.join(save_dir, f"impact_analysis_{chosen_t}_equal_impact_sampling.png"), dpi=300, bbox_inches='tight') if save_dir else None
 
 
@@ -826,8 +836,9 @@ def main():
     parser.add_argument('-tsd', '--tile_score_dir', type=str, default=None, help='Dir from which to take tile scores')
     parser.add_argument('-ce',  '--comp_embeds', action='store_true', default=False, help='Use compressed tile embeddings')
     parser.add_argument('-ccp', '--compute_ci_pval', action='store_true', default=False, help='Compute 95% CI and p-val')
+    parser.add_argument('-mci', '--metrics_ci', action='store_true', default=False, help='Compute 95% CI for metrics')
     parser.add_argument('-cm', '--clinical_metrics', action='store_true', default=False, help='Compute clinical metrics')
-    parser.add_argument('-high', '--high_categories', action='store_true', default=True, help='Plot only sensitivity and ppv (high categories) instead of specificity and npv (low categories)')
+    parser.add_argument('-high', '--high_categories', action='store_true', default=False, help='Plot only sensitivity and ppv (high categories) instead of specificity and npv (low categories)')
     # parser.add_argument('-ct', '--chosen_threshold', type=float, help='Chosen threshold for clinical metrics', default=0.6)
     parser.add_argument('-ct', '--chosen_threshold', type=float, nargs='+', help='Chosen thresholds for clinical metrics', default=[0.6])
     parser.add_argument('-test', '--test', action='store_true', default=False, help='Compute metrics for test set')
@@ -913,7 +924,7 @@ def main():
                 c_dict = {"Specificity": "orange", "Sensitivity": "navy", "PPV": "green", "NPV": "purple","Impacted patients": "cyan"}
 
                 # plot_threshold_analysis(y_true, baseline_scores, local_scores, chosen_t=args.chosen_threshold, n_boot=1000, c_dict=c_dict, save_dir=args.save_dir)
-                plot_impact_analysis(y_true, local_scores, chosen_t=args.chosen_threshold, n_boot=1000, high=args.high_categories, c_dict=c_dict, save_dir=args.save_dir)
+                plot_impact_analysis(args, y_true, local_scores, c_dict=c_dict)
 
         else:
             print(f'Please provide exactly two output dirs to compute 95% CI and p-val.\n'
