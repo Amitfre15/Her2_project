@@ -679,14 +679,14 @@ def find_matching_score(tile_name: str = None, slide_context: SlideContext = Non
     he_thumb_window_center = min(he_thumb_window_center[0], slide_context.map_mat.shape[0] - 1), min(he_thumb_window_center[1], slide_context.map_mat.shape[1] - 1)
     if window_name is not None:
         matching_coords = slide_context.map_mat[he_thumb_window_center[0] - 150: he_thumb_window_center[0] + 150,
-                                he_thumb_window_center[1] - 150: he_thumb_window_center[1] + 150][:, :, :2]
+                                                he_thumb_window_center[1] - 150: he_thumb_window_center[1] + 150][:, :, :2]
         mask = ~(np.all(matching_coords == [0, 0], axis=-1))
         ihc_thumb_window_center = matching_coords[mask]
         if ihc_thumb_window_center.size == 0:
             return None
         ihc_thumb_window_center = np.mean(ihc_thumb_window_center, axis=0).astype(int)
         matching_scores = slide_context.score_mat[ihc_thumb_window_center[1] - 50: ihc_thumb_window_center[1] + 50,
-                      ihc_thumb_window_center[0] - 50: ihc_thumb_window_center[0] + 50].flatten()
+                                                  ihc_thumb_window_center[0] - 50: ihc_thumb_window_center[0] + 50].flatten()
         score = matching_scores[matching_scores != 0]
         score = np.mean(score)
     else:
