@@ -9,23 +9,201 @@ import matplotlib.pyplot as plt
 import numpy as np
 import cv2
 import argparse
+import tqdm
+import open3d as o3d
+
 from skimage.morphology import disk
 from skimage.morphology import binary_opening
 from skimage.measure import regionprops, label
-import tqdm
-import open3d as o3d
 from scipy.spatial import Delaunay, ConvexHull
 from sklearn.neighbors import NearestNeighbors
 from sklearn.metrics.pairwise import pairwise_distances
+from typing import List, Tuple, Optional, Any, Dict
+from dataclasses import dataclass, field
 
 HER2_PATCH_SIZE = 26
 MIN_OUTER_POINTS = '5'
 DESIRED_MPP = 1
 SLIDE_PATCH_SIZE = 256
 EXPECTED_THUMBS = 3 # H&E, Her2, and Her2 copy for orientation checking
-MIN_LANDMARKS = 6 # At least 4 for rigid transformation and 2 for evaluation
-NUM_INIT_LANDMARKS = 4 # At least 4 for rigid transformation
+MIN_LANDMARKS = 6 # At least 4 for global transformation and 2 for evaluation
+NUM_INIT_LANDMARKS = 4 # At least 4 for global transformation
 LANDMARK_COLOR = [0.0, 0.470588, 0.843137] # (0, 120, 215) - Photos default
+INIT_ICP_MATCH_THRESHOLD = 500
+MIN_ICP_MATCH_THRESHOLD = 50
+ICP_MATCH_THRESHOLD_STEP = 50
+UPPER_PAIR_DIST_THRESHOLD = 80
+FITNESS_THRESHOLD = 0.9
+
+# =========================================================
+# Dataclasses
+# =========================================================
+
+@dataclass
+class SlideContext:
+    dir: str
+    folder_path: str
+
+    im_HE: np.ndarray
+    im_Her2: np.ndarray
+    im_Her2_copy: np.ndarray
+    output_mapping_file: str
+
+    S_land_HE: np.ndarray
+    S_land_Her2: np.ndarray
+    S_land_HE_3d: np.ndarray
+    S_land_Her2_3d: np.ndarray
+
+    extra: Dict[str, Any] = field(default_factory=dict)
+
+# =========================================================
+# Argument parsing
+# =========================================================
+
+def parse_args():
+    # Argument parser
+    parser = argparse.ArgumentParser(description="Match pairs of thumbnails through a mapping matrix.")
+    parser.add_argument('-r',  '--root', default=os.path.join('slides_to_amit2', 'match_thumbs_HE_Her2', 'Marked', 'png_thumb_pairs_karin'), help='Root directory to search for thumbnail pairs.')
+    parser.add_argument('-dn', '--dict_name', type=str, default='rigid_one_out_LS', help='Name for the distance dictionary saved.')
+    parser.add_argument('-d',  '--display', action='store_true', default=False, help='Whether to display images and plots during processing.')
+    parser.add_argument('-ut', '--use_triangulation', action='store_true', default=False, help='Whether to match using Delunay triangulation.')
+
+    return parser.parse_args()
+
+def get_folder_path(args, dir):
+    folder = os.path.join(args.root, dir)
+    if not os.path.isdir(folder):
+        print(f'{dir} is not a directory')
+        raise NotADirectoryError(f'{dir} is not a directory')
+    
+    return folder
+
+def get_thumb_names(args, folder):
+    png_images = list(filter(lambda x: x.endswith('.png') and not x.startswith('map') and not x.startswith('Transformed'), os.listdir(folder)))
+    if len(png_images) < EXPECTED_THUMBS:
+        # tri_dist[dir] = 'Directory does not contain enough images'
+        args.global_dist_dict[dir] = 'Directory does not contain enough images'
+        print('Directory does not contain enough images')
+        raise ValueError('Directory does not contain enough images')
+
+    thumb_HE, thumb_Her2, thumb_Her2_copy = parse_thumb_names(png_images=png_images)
+    return thumb_HE, thumb_Her2, thumb_Her2_copy
+
+def load_thumbs(args, folder, thumb_HE, thumb_Her2, thumb_Her2_copy):
+    im_HE, im_Her2, im_Her2_copy, output_mapping_file = load_and_display_thumbs(folder_path=folder, HE_thumb_name=thumb_HE, Her2_thumb_name=thumb_Her2,
+                                                                                Her2_thumb_copy_name=thumb_Her2_copy, display=args.display)
+
+    im_Her2 = rotate_back_annotation_img(im_Her2=im_Her2, im_Her2_copy=im_Her2_copy, display=args.display)
+    if type(im_Her2) is int:
+        args.global_dist_dict[dir] = 'Could not rotate Her2 image back to original orientation'
+        raise ValueError('Could not rotate Her2 image back to original orientation')
+
+    return im_HE, im_Her2, im_Her2_copy, output_mapping_file
+
+def detect_landmarks(args, im_HE, im_Her2):
+    # Find landmarks
+    landmark_color = np.array(LANDMARK_COLOR).astype(np.float32)
+
+    try:
+        if dir in args.global_dist_dict:
+            args.global_dist_dict.pop(dir)
+        S_land_HE, S_land_Her2 = landmark_detection(im_HE=im_HE, im_Her2=im_Her2, landmark_color=landmark_color, display=args.display)
+        if len(S_land_HE) == 0:  # try other landmark color (some cases were annotated in black)
+            S_land_HE, S_land_Her2 = landmark_detection(im_HE=im_HE, im_Her2=im_Her2, landmark_color=np.array([0.0, 0.0, 0.0]))
+    except ValueError as e:
+        args.global_dist_dict[dir] = str(e)
+        print(e)
+        raise e
+
+    if len(S_land_HE) < MIN_LANDMARKS:
+        args.global_dist_dict[dir] = f'Insufficient landmark count: {len(S_land_HE)}'
+        print(f'Insufficient landmark count: {len(S_land_HE)}')
+        raise ValueError(f'Insufficient landmark count: {len(S_land_HE)}')
+
+    return S_land_HE, S_land_Her2
+
+def verify_no_duplicate_mappings(args, slide_ctx, HE_Her2_land_mapping):
+    # Check for duplicate elements
+    _, counts = np.unique(HE_Her2_land_mapping, return_counts=True)
+    has_duplicates = np.any(counts > 1)
+    if has_duplicates:
+        args.global_dist_dict[slide_ctx.dir] = f"HE_Her2_land_mapping has correspondence overlap: {HE_Her2_land_mapping}"
+        print(f"HE_Her2_land_mapping has correspondence overlap: {HE_Her2_land_mapping}")
+        raise ValueError(f"HE_Her2_land_mapping has correspondence overlap: {HE_Her2_land_mapping}")
+
+def evaluate_registration_w_inner_points(args, slide_ctx, HE_Her2_land_mapping, inner_points_mask):
+    for i in np.arange(slide_ctx.PT_HE.shape[0]):
+        inner_points_indices = np.where(inner_points_mask)[0]
+        curr_tri_dist, curr_global_dist = evaluate_w_sub_group(slide_ctx, HE_Her2_land_mapping=HE_Her2_land_mapping, inner_points_indices=inner_points_indices, metric_point_index=i)
+        if slide_ctx.dir not in args.global_dist_dict:
+            # tri_dist[slide_ctx.dir] = curr_tri_dist
+            args.global_dist_dict[slide_ctx.dir] = curr_global_dist
+        else:
+            for k in args.global_dist_dict[slide_ctx.dir].keys():
+                args.global_dist_dict[slide_ctx.dir][k] = np.hstack((args.global_dist_dict[slide_ctx.dir][k], curr_global_dist[k]))
+
+    for k in args.global_dist_dict[slide_ctx.dir].keys():
+        args.global_dist_dict[slide_ctx.dir][k] = np.mean(args.global_dist_dict[slide_ctx.dir][k])
+
+def create_save_final_map(args, slide_ctx):
+    im_map = create_global_map(args, slide_ctx)
+    if args.use_triangulation:
+        im_map = triangulate_and_create_map(PT_HE=slide_ctx.PT_HE, PT_Her2=slide_ctx.PT_Her2, im_HE=slide_ctx.im_HE, im_Her2=slide_ctx.im_Her2)
+
+    img_16bit = im_map.astype(np.uint16)
+    # Now we can use cv2.cvtColor
+    bgr_im_map = cv2.cvtColor(img_16bit, cv2.COLOR_RGB2BGR)
+
+    cv2.imwrite(slide_ctx.output_mapping_file, bgr_im_map)
+    print(f'saved mapping file to {slide_ctx.output_mapping_file}')
+
+    # Verify the saved file
+    im_map_uint16_rec = cv2.imread(slide_ctx.output_mapping_file, cv2.IMREAD_UNCHANGED)
+    if not np.array_equal(bgr_im_map, im_map_uint16_rec):
+        print("Warning: The saved mapping file does not match the original.")
+
+def prepare_slide_context(args, dir):
+    folder_path = get_folder_path(args, dir)
+    thumb_HE, thumb_Her2, thumb_Her2_copy = get_thumb_names(args, folder_path)
+    im_HE, im_Her2, im_Her2_copy, output_mapping_file = load_thumbs(args, folder_path, thumb_HE, thumb_Her2, thumb_Her2_copy)
+    S_land_HE, S_land_Her2 = detect_landmarks(args, im_HE, im_Her2)
+    pts_moving = S_land_HE / 2  # HE thumbs were created twice the size of the Her2 thumbs for some reason
+    pts_fixed = S_land_Her2
+
+    S_land_HE_3d = np.hstack([pts_moving, np.zeros((len(S_land_HE), 1))])  # For point cloud
+    S_land_Her2_3d = np.hstack([pts_fixed, np.zeros((len(S_land_Her2), 1))])
+
+    if args.display:
+        plot_landmarks(S_land_HE_3d[:, [1, 0, 2]], S_land_Her2_3d[:, [1, 0, 2]], f'Initial H&E Landmarks - {dir}', 'Her2 Landmarks')
+
+    return SlideContext(
+        dir = dir,
+        folder_path=folder_path,
+
+        im_HE=im_HE,
+        im_Her2=im_Her2,
+        im_Her2_copy=im_Her2_copy,
+        output_mapping_file=output_mapping_file,
+
+        S_land_HE=S_land_HE,
+        S_land_Her2=S_land_Her2,
+        S_land_HE_3d=S_land_HE_3d,
+        S_land_Her2_3d=S_land_Her2_3d,
+    )
+
+def process_slide(args, slide_ctx):
+    HE_Her2_land_mapping, pairs_dist, best_trnsfrm, trans_init_rotated, translation = match_landmarks(args, slide_ctx)
+
+    # Mapping for H&E and Her2
+    slide_ctx.PT_HE = slide_ctx.S_land_HE[HE_Her2_land_mapping]
+    slide_ctx.PT_Her2 = slide_ctx.S_land_Her2
+
+    inner_points_mask = get_inner_hull_point_mask(points=slide_ctx.PT_HE)
+
+    evaluate_registration_w_inner_points(args, slide_ctx, HE_Her2_land_mapping, inner_points_mask)
+    create_save_final_map(args, slide_ctx)
+    
+
 
 # Function to load and normalize image
 def load_image(path):
@@ -192,19 +370,19 @@ def find_and_apply_best_trnsfrm(S_land_HE_3d: np.array, S_land_Her2_3d: np.array
     # Select the best transformation based on fitness
     filtered_results = list(filter(lambda x: x[1] == max_fitness, results))
 
-    best_mean_rigid_dist = math.inf
+    best_mean_global_dist = math.inf
     best_fitness = 0
     if left_out_points is not None:
         for transformation, fitness, rot_points, rot_lo, trans_init_rotated, translation in filtered_results:
             rot_lo = np.dot(rot_lo, transformation[:3, :3].T) + transformation[:3, 3]
             if relevant_mask is not None:
-                mean_rigid_dist = np.mean(np.sqrt(np.sum((left_out_true_pairs - rot_lo)[relevant_mask] ** 2, axis=1)))
+                mean_global_dist = np.mean(np.sqrt(np.sum((left_out_true_pairs - rot_lo)[relevant_mask] ** 2, axis=1)))
             else:
-                mean_rigid_dist = np.sqrt(np.sum((left_out_true_pairs - rot_lo) ** 2))
-            if mean_rigid_dist < best_mean_rigid_dist:
+                mean_global_dist = np.sqrt(np.sum((left_out_true_pairs - rot_lo) ** 2))
+            if mean_global_dist < best_mean_global_dist:
                 best_transformation, best_fitness, best_rot_points, best_rot_lo, best_trans_init_rotated, best_translation = (
                     transformation, fitness, rot_points, rot_lo, trans_init_rotated, translation)
-                best_mean_rigid_dist = mean_rigid_dist
+                best_mean_global_dist = mean_global_dist
     else:
         best_transformation, best_fitness, best_rot_points, best_rot_lo, best_trans_init_rotated, best_translation = max(results, key=lambda x: x[1])
 
@@ -232,11 +410,10 @@ def find_and_apply_best_trnsfrm(S_land_HE_3d: np.array, S_land_Her2_3d: np.array
     return S_land_HE_transformed, best_fitness, best_rot_lo, best_transformation, best_trans_init_rotated, best_translation
 
 
-def create_rigid_map(PT_HE: np.array, PT_Her2: np.array, im_HE: np.array, im_Her2: np.array, dir_name: str, base_path: str = None,
-                     display: bool = True):
+def create_global_map(args, slide_ctx):
     # Define bounding box and pixels in H&E
-    min_y, min_x = np.floor(np.min(PT_HE, axis=0)).astype(int)
-    max_y, max_x = np.ceil(np.max(PT_HE, axis=0)).astype(int)
+    min_y, min_x = np.floor(np.min(slide_ctx.PT_HE, axis=0)).astype(int)
+    max_y, max_x = np.ceil(np.max(slide_ctx.PT_HE, axis=0)).astype(int)
     y, x = np.meshgrid(np.arange(min_y, max_y), np.arange(min_x, max_x))
     pixels = np.vstack([y.ravel(), x.ravel()]).T
     # pixels_to_trnsfrm = pixels // 2
@@ -244,25 +421,25 @@ def create_rigid_map(PT_HE: np.array, PT_Her2: np.array, im_HE: np.array, im_Her
     pixels_hom = np.hstack([pixels, np.ones((len(pixels), 1))])
 
     # Initialize transformed image and mapping image
-    im_transformed = np.copy(im_HE)
-    im_map = np.zeros_like(im_HE)
+    im_transformed = np.copy(slide_ctx.im_HE)
+    im_map = np.zeros_like(slide_ctx.im_HE)
 
     # Create the (x, y) grid for the Her2 image
-    im_XY = np.dstack(np.meshgrid(np.arange(im_Her2.shape[1]), np.arange(im_Her2.shape[0])))
+    im_XY = np.dstack(np.meshgrid(np.arange(slide_ctx.im_Her2.shape[1]), np.arange(slide_ctx.im_Her2.shape[0])))
 
     # pixels_transformed_Her2 = np.dot(pixels_hom, trans_init_rotated[:3, :3].T)
     # pixels_transformed_Her2 = pixels_transformed_Her2 + np.hstack((translation, 0))
     # pixels_transformed_Her2 = np.dot(pixels_transformed_Her2, best_trnsfrm[:3, :3].T) + best_trnsfrm[:3, 3]
 
     # Compute the affine transformation matrix between the two triangles
-    A = np.linalg.lstsq(np.hstack([PT_HE, np.ones((len(PT_HE), 1))]), PT_Her2, rcond=None)[0]
+    A = np.linalg.lstsq(np.hstack([slide_ctx.PT_HE, np.ones((len(slide_ctx.PT_HE), 1))]), slide_ctx.PT_Her2, rcond=None)[0]
 
     # Apply the transformation to the pixels of the current triangle
     pixels_transformed_Her2 = np.dot(pixels_hom, A)
 
     # Round and clip the coordinates for image indexing
     pixels_transformed_Her2 = np.round(pixels_transformed_Her2).astype(int)[:, :2]
-    pixels_transformed_Her2 = np.clip(pixels_transformed_Her2, 0, np.array(im_Her2.shape[:2]) - 1)
+    pixels_transformed_Her2 = np.clip(pixels_transformed_Her2, 0, np.array(slide_ctx.im_Her2.shape[:2]) - 1)
 
     # Convert pixel coordinates to integer after rounding
     y_transformed = np.round(pixels_transformed_Her2[:, 0]).astype(int)
@@ -272,10 +449,10 @@ def create_rigid_map(PT_HE: np.array, PT_Her2: np.array, im_HE: np.array, im_Her
     x_curr = np.round(pixels[:, 1]).astype(int)
 
     # Filter out any out-of-bound indices
-    valid_mask = (x_transformed >= 0) & (x_transformed < im_Her2.shape[1]) & \
-                 (y_transformed >= 0) & (y_transformed < im_Her2.shape[0]) & \
-                 (x_curr >= 0) & (x_curr < im_HE.shape[1]) & \
-                 (y_curr >= 0) & (y_curr < im_HE.shape[0])
+    valid_mask = (x_transformed >= 0) & (x_transformed < slide_ctx.im_Her2.shape[1]) & \
+                 (y_transformed >= 0) & (y_transformed < slide_ctx.im_Her2.shape[0]) & \
+                 (x_curr >= 0) & (x_curr < slide_ctx.im_HE.shape[1]) & \
+                 (y_curr >= 0) & (y_curr < slide_ctx.im_HE.shape[0])
 
     x_transformed = x_transformed[valid_mask]
     y_transformed = y_transformed[valid_mask]
@@ -283,9 +460,9 @@ def create_rigid_map(PT_HE: np.array, PT_Her2: np.array, im_HE: np.array, im_Her
     y_curr = y_curr[valid_mask]
 
     # Update the transformed image for each channel (R, G, B)
-    im_transformed[y_curr, x_curr, 0] = im_Her2[y_transformed, x_transformed, 0]  # Red channel
-    im_transformed[y_curr, x_curr, 1] = im_Her2[y_transformed, x_transformed, 1]  # Green channel
-    im_transformed[y_curr, x_curr, 2] = im_Her2[y_transformed, x_transformed, 2]  # Blue channel
+    im_transformed[y_curr, x_curr, 0] = slide_ctx.im_Her2[y_transformed, x_transformed, 0]  # Red channel
+    im_transformed[y_curr, x_curr, 1] = slide_ctx.im_Her2[y_transformed, x_transformed, 1]  # Green channel
+    im_transformed[y_curr, x_curr, 2] = slide_ctx.im_Her2[y_transformed, x_transformed, 2]  # Blue channel
 
     # Set the mapping matrix values
     im_map[y_curr, x_curr, 0] = im_XY[y_transformed, x_transformed, 0]
@@ -311,11 +488,9 @@ def create_rigid_map(PT_HE: np.array, PT_Her2: np.array, im_HE: np.array, im_Her
     im_map[y_curr, x_curr, 2] = theta
 
     # Display the transformed image
-    if display:
-        save_path = os.path.join(base_path, dir_name) if base_path else None
+    if args.display:
         im_downsampled = cv2.resize(im_transformed[max(min_y - 700, 0):min(max_y + 700, im_transformed.shape[0]), :], (0, 0), fx=0.25, fy=0.25)  # 25% size
-        display_image(im_downsampled,
-                      f"Transformed Her2 on H&E - {dir_name}", save_path=save_path)
+        display_image(im_downsampled, f"Transformed Her2 on H&E - {slide_ctx.dir}", save_path=slide_ctx.folder_path)
 
     return im_map
 
@@ -431,46 +606,44 @@ def transform_sub_group(PT_HE_chosen: np.array, PT_HE_unchosen: np.array, PT_Her
                         im_HE: np.array, im_Her2: np.array, S_land_HE_3d: np.array, HE_3d_chosen: np.array,
                         HE_3d_unchosen: np.array, Her2_3d_chosen: np.array, Her2_3d_unchosen: np.array, metric_point: np.array,
                         metric_point_3d: np.array, Her2_metric_point_3d: np.array, icp_threshold: int = 500):
-    # Rigid evaluation
+    # global evaluation
     trnsfrm_fitness = 0
     icp_trials = 0
     curr_thresh = icp_threshold
-    mean_rigid_dist = math.inf
+    mean_global_dist = math.inf
 
     mean_dists = []
-    while (mean_rigid_dist > 100 or trnsfrm_fitness < 0.9) and curr_thresh > 0:
+    while (mean_global_dist > 100 or trnsfrm_fitness < 0.9) and curr_thresh > 0:
         best_results = find_and_apply_best_trnsfrm(S_land_HE_3d=HE_3d_chosen, S_land_Her2_3d=Her2_3d_chosen, left_out_points=metric_point_3d,
                                                    left_out_true_pairs=Her2_metric_point_3d, icp_threhold=curr_thresh, display=False)
         trnsfrm_fitness, transformed_lo = best_results[1], best_results[2]
 
-        mean_rigid_dist = np.sqrt(np.sum((Her2_metric_point_3d - transformed_lo) ** 2))
-        mean_dists.append(mean_rigid_dist)
+        mean_global_dist = np.sqrt(np.sum((Her2_metric_point_3d - transformed_lo) ** 2))
+        mean_dists.append(mean_global_dist)
         icp_trials += 1
         curr_thresh = icp_threshold - icp_trials * 50
-    mean_rigid_dist = min(mean_dists)
+    mean_global_dist = min(mean_dists)
 
-    # return mean_tri_dist, mean_rigid_dist
-    return None, mean_rigid_dist
+    # return mean_tri_dist, mean_global_dist
+    return None, mean_global_dist
 
 
-def evaluate_w_sub_group(PT_HE: np.array, PT_Her2: np.array, im_HE: np.array, im_Her2: np.array, S_land_HE_3d: np.array,
-                         S_land_Her2_3d: np.array, HE_Her2_land_mapping: np.array,
-                         inner_points_indices: np.array, metric_point_index: np.array = None):
-    tri_dist, rigid_dist = {}, {}
-    S_land_HE_3d = S_land_HE_3d[HE_Her2_land_mapping]
+def evaluate_w_sub_group(slide_ctx, HE_Her2_land_mapping: np.array, inner_points_indices: np.array, metric_point_index: np.array = None):
+    tri_dist, global_dist = {}, {}
+    S_land_HE_3d = slide_ctx.S_land_HE_3d[HE_Her2_land_mapping]
 
     metric_point, metric_point_3d, Her2_metric_point_3d = np.empty((1, 1)), np.empty((1, 1)), np.empty((1, 1))
-    # init metric point for both triangulation and rigid transform
-    metric_point, Her2_metric_point = PT_HE[metric_point_index].reshape(1, -1), PT_Her2[metric_point_index].reshape(1, -1)
-    PT_HE, PT_Her2 = np.delete(PT_HE, metric_point_index, axis=0), np.delete(PT_Her2, metric_point_index, axis=0)
-    metric_point_3d, Her2_metric_point_3d = S_land_HE_3d[metric_point_index].reshape(1, -1), S_land_Her2_3d[
-        metric_point_index].reshape(1, -1)
-    S_land_HE_3d, S_land_Her2_3d_mapped = np.delete(S_land_HE_3d, metric_point_index, axis=0), np.delete(
-        S_land_Her2_3d, metric_point_index, axis=0)
-    
+
+    # init metric point for both triangulation and global transform
+    metric_point, Her2_metric_point = slide_ctx.PT_HE[metric_point_index].reshape(1, -1), slide_ctx.PT_Her2[metric_point_index].reshape(1, -1)
+    curr_PT_HE, curr_PT_Her2 = np.delete(slide_ctx.PT_HE, metric_point_index, axis=0), np.delete(slide_ctx.PT_Her2, metric_point_index, axis=0)
+
+    metric_point_3d, Her2_metric_point_3d = slide_ctx.S_land_HE_3d[metric_point_index].reshape(1, -1), slide_ctx.S_land_Her2_3d[metric_point_index].reshape(1, -1)
+    S_land_HE_3d, S_land_Her2_3d_mapped = np.delete(slide_ctx.S_land_HE_3d, metric_point_index, axis=0), np.delete(slide_ctx.S_land_Her2_3d, metric_point_index, axis=0)
+
     # init other points
-    PT_HE_chosen, PT_HE_unchosen = PT_HE[0].reshape(1, -1), PT_HE[1:]
-    PT_Her2_chosen, PT_Her2_unchosen = PT_Her2[0].reshape(1, -1), PT_Her2[1:]
+    PT_HE_chosen, PT_HE_unchosen = curr_PT_HE[0].reshape(1, -1), curr_PT_HE[1:]
+    PT_Her2_chosen, PT_Her2_unchosen = curr_PT_Her2[0].reshape(1, -1), curr_PT_Her2[1:]
     HE_3d_chosen, HE_3d_unchosen = S_land_HE_3d[0].reshape(1, -1), S_land_HE_3d[1:]
     Her2_3d_chosen, Her2_3d_unchosen = S_land_Her2_3d_mapped[0].reshape(1, -1), S_land_Her2_3d_mapped[1:]
 
@@ -486,7 +659,7 @@ def evaluate_w_sub_group(PT_HE: np.array, PT_Her2: np.array, im_HE: np.array, im
     unchosen_indices = np.arange(PT_HE_unchosen.shape[0])
     for j in range(1, PT_HE_unchosen.shape[0] + 1):
         tmp_len = PT_HE_chosen.shape[0] + j
-        tri_dist[str(tmp_len)], rigid_dist[str(tmp_len)] = [], []
+        tri_dist[str(tmp_len)], global_dist[str(tmp_len)] = [], []
         possible_ind_groups = list(itertools.combinations(unchosen_indices, j))
         index_groups = random.sample(possible_ind_groups, min(len(possible_ind_groups), 10))
         for ind_gr in index_groups:
@@ -495,7 +668,7 @@ def evaluate_w_sub_group(PT_HE: np.array, PT_Her2: np.array, im_HE: np.array, im
                                             Her2_3d_chosen=Her2_3d_chosen, Her2_3d_unchosen=Her2_3d_unchosen, top_index=np.array(ind_gr))
             PT_HE_chosen_tmp, PT_HE_unchosen_tmp, PT_Her2_chosen_tmp, PT_Her2_unchosen_tmp, HE_3d_chosen_tmp, HE_3d_unchosen_tmp, Her2_3d_chosen_tmp, Her2_3d_unchosen_tmp = arrays_tuple
 
-            # mean_tri_dist, mean_rigid_dist = transform_sub_group(PT_HE_chosen=PT_HE_chosen_tmp, PT_HE_unchosen=PT_HE_unchosen_tmp,
+            # mean_tri_dist, mean_global_dist = transform_sub_group(PT_HE_chosen=PT_HE_chosen_tmp, PT_HE_unchosen=PT_HE_unchosen_tmp,
             #                                            PT_Her2_chosen=PT_Her2_chosen_tmp,
             #                                            PT_Her2_unchosen=PT_Her2_unchosen_tmp, im_HE=im_HE,
             #                                            im_Her2=im_Her2, S_land_HE_3d=S_land_HE_3d,
@@ -512,44 +685,44 @@ def evaluate_w_sub_group(PT_HE: np.array, PT_Her2: np.array, im_HE: np.array, im
             # Apply the transformation to the pixels of the current triangle
             metric_transformed_to_Her2 = np.dot(np.hstack([metric_point, np.ones((len(metric_point), 1))]), A)
 
-            mean_rigid_dist = np.sqrt(np.sum((metric_transformed_to_Her2[:, :2] - Her2_metric_point) ** 2))
+            mean_global_dist = np.sqrt(np.sum((metric_transformed_to_Her2[:, :2] - Her2_metric_point) ** 2))
 
-            if mean_rigid_dist is not None:
+            if mean_global_dist is not None:
                 # tri_dist[str(tmp_len)].append(mean_tri_dist)
-                rigid_dist[str(tmp_len)].append(mean_rigid_dist)
+                global_dist[str(tmp_len)].append(mean_global_dist)
     # for k in tri_dist.keys():
-    for k in rigid_dist.keys():
+    for k in global_dist.keys():
         # tri_dist[k] = np.mean(tri_dist.get(k))
-        rigid_dist[k] = np.mean(rigid_dist.get(k))
+        global_dist[k] = np.mean(global_dist.get(k))
 
-    return tri_dist, rigid_dist
+    return tri_dist, global_dist
 
 
-def show_dist_plot(tri_dist: list, rigid_dist: list):
-    tri_dist, rigid_dist = np.array(tri_dist), np.array(rigid_dist)
-    rigid_minus_tri = rigid_dist - tri_dist
+def show_dist_plot(tri_dist: list, global_dist: list):
+    tri_dist, global_dist = np.array(tri_dist), np.array(global_dist)
+    global_minus_tri = global_dist - tri_dist
     print(f'tri_dist = {tri_dist}\ntri_dist max = {max(tri_dist)}\ntri_dist avg = {np.mean(tri_dist)}')
-    print(f'rigid_dist = {rigid_dist}\nrigid_dist max = {max(rigid_dist)}\nrigid_dist avg = {np.mean(rigid_dist)}')
+    print(f'global_dist = {global_dist}\nglobal_dist max = {max(global_dist)}\nglobal_dist avg = {np.mean(global_dist)}')
 
     # Compute mean and max for each list
     tri_mean, tri_max = np.mean(tri_dist), np.max(tri_dist)
-    rigid_mean, rigid_max = np.mean(rigid_dist), np.max(rigid_dist)
-    diff_mean = np.mean(rigid_minus_tri)
+    global_mean, global_max = np.mean(global_dist), np.max(global_dist)
+    diff_mean = np.mean(global_minus_tri)
 
     # Create histograms
     plt.figure(figsize=(10, 6))
     # plt.plot(tri_dist, marker='o', linestyle='-', label='Triangulation distances', color='blue')
-    # plt.plot(rigid_dist, marker='o', linestyle='-', label='Rigid Transformation distances', color='orange')
-    plt.plot(rigid_minus_tri, marker='o', linestyle='-', label='Rigid minus Triangulation', color='orange')
+    # plt.plot(global_dist, marker='o', linestyle='-', label='Global Transformation distances', color='orange')
+    plt.plot(global_minus_tri, marker='o', linestyle='-', label='Global minus Triangulation', color='orange')
 
     # Plot mean and max lines for tri_dist
     # plt.axhline(tri_mean, color='blue', linestyle='dashed', linewidth=2, label='Mean (tri_dist)')
     # plt.axhline(tri_max, color='blue', linestyle='solid', linewidth=2, label='Max (tri_dist)')
 
-    # Plot mean and max lines for rigid_dist
-    # plt.axhline(rigid_mean, color='orange', linestyle='dashed', linewidth=2, label='Mean (rigid_dist)')
-    # plt.axhline(rigid_max, color='orange', linestyle='solid', linewidth=2, label='Max (rigid_dist)')
-    plt.axhline(diff_mean, color='orange', linestyle='solid', linewidth=2, label='Mean (rigid_dist - tri dist)')
+    # Plot mean and max lines for global_dist
+    # plt.axhline(global_mean, color='orange', linestyle='dashed', linewidth=2, label='Mean (global_dist)')
+    # plt.axhline(global_max, color='orange', linestyle='solid', linewidth=2, label='Max (global_dist)')
+    plt.axhline(diff_mean, color='orange', linestyle='solid', linewidth=2, label='Mean (global_dist - tri dist)')
 
     # Add labels and legend
     plt.xlabel('Index')
@@ -561,26 +734,22 @@ def show_dist_plot(tri_dist: list, rigid_dist: list):
     plt.show()
 
 
-def show_dist_hist(rigid_dist: dict):
-    final_tri_dists, final_rigid_dists = {}, {}
-    for k in rigid_dist.keys():
+def show_dist_hist(global_data_dict: dict):
+    final_tri_dists, final_global_dists = {}, {}
+    for k in global_data_dict.keys():
         # final_tri_dists[k] = list(tri_dist[k].values())[-1]
-        if any(np.array(list(rigid_dist[k].values())) > 100):
-            print(f'k = {k}, v.values() = {rigid_dist[k].values()}')
-        final_rigid_dists[k] = list(rigid_dist[k].values())[-1] if len(rigid_dist[k].values()) > 0 else list(rigid_dist[k].values())
+        if any(np.array(list(global_data_dict[k].values())) > 100):
+            print(f'k = {k}, v.values() = {global_data_dict[k].values()}')
+        final_global_dists[k] = list(global_data_dict[k].values())[-1] if len(global_data_dict[k].values()) > 0 else list(global_data_dict[k].values())
 
 
     # np_final_tri = np.array(list(final_tri_dists.values())) / HER2_PATCH_SIZE
-    np_final_rigid = np.array(list(final_rigid_dists.values())) / HER2_PATCH_SIZE
-
-    # tri_dist, rigid_dist = np.array(tri_dist), np.array(rigid_dist)
-    # print(f'tri_dist = {tri_dist}\ntri_dist max = {max(tri_dist)}\ntri_dist avg = {np.mean(tri_dist)}')
-    # print(f'rigid_dist = {rigid_dist}\nrigid_dist max = {max(rigid_dist)}\nrigid_dist avg = {np.mean(rigid_dist)}')
+    np_final_global = np.array(list(final_global_dists.values())) / HER2_PATCH_SIZE
 
     # Compute mean and max for each list
     # tri_mean, tri_max = np.mean(np_final_tri), np.max(np_final_tri)
-    rigid_mean, rigid_max = np.mean(np_final_rigid), np.max(np_final_rigid)
-    print(f'rigid_mean = {rigid_mean}')
+    global_mean, global_max = np.mean(np_final_global), np.max(np_final_global)
+    print(f'global_mean = {global_mean}')
 
     # Double font sizes globally
     plt.rcParams.update({'font.size': 16})
@@ -589,15 +758,15 @@ def show_dist_hist(rigid_dist: dict):
     plt.figure(figsize=(10, 6))
 
     # plt.hist(np_final_tri, bins=10, alpha=0.5, label='Triangulation distances', color='blue')
-    plt.hist(np_final_rigid, bins=10, alpha=0.5, label='Rigid transformation distances', color='orange')
+    plt.hist(np_final_global, bins=10, alpha=0.5, label='Global transformation distances', color='orange')
 
     # Plot mean and max lines for tri_dist
     # plt.axvline(tri_mean, color='blue', linestyle='dashed', linewidth=2, label='Mean (tri_dist)')
     # plt.axvline(tri_max, color='blue', linestyle='solid', linewidth=2, label='Max (tri_dist)')
 
-    # Plot mean and max lines for rigid_dist
-    plt.axvline(rigid_mean, color='orange', linestyle='dashed', linewidth=2, label='Mean line (rigid distances)')
-    # plt.axvline(rigid_max, color='orange', linestyle='solid', linewidth=2, label='Max (rigid_dist)')
+    # Plot mean and max lines for global_dist
+    plt.axvline(global_mean, color='orange', linestyle='dashed', linewidth=2, label='Mean line (global distances)')
+    # plt.axvline(global_max, color='orange', linestyle='solid', linewidth=2, label='Max (global_dist)')
 
     # Add labels and legend
     plt.xlabel(f'Distance (proportion out of MPP={DESIRED_MPP} {SLIDE_PATCH_SIZE}px patch)')
@@ -609,10 +778,10 @@ def show_dist_hist(rigid_dist: dict):
     plt.show()
 
 
-def show_mean_dist_area_prop(rigid_data_dict: dict, avg_dirs: bool = False, show_area: bool = False):
+def show_mean_dist_area_prop(global_data_dict: dict, avg_dirs: bool = False, show_area: bool = False):
     if not avg_dirs:
         # Calculate rows needed for two columns
-        num_dirs = len(rigid_data_dict)
+        num_dirs = len(global_data_dict)
         ncols = 2
         nrows = math.ceil(num_dirs / ncols)
 
@@ -625,19 +794,19 @@ def show_mean_dist_area_prop(rigid_data_dict: dict, avg_dirs: bool = False, show
 
         # Plot each directory's data
         # for i, (directory, values) in enumerate(tri_data_dict.items()):
-        for i, (directory, values) in enumerate(rigid_data_dict.items()):
-            rigid_values = rigid_data_dict[directory]
+        for i, (directory, values) in enumerate(global_data_dict.items()):
+            global_values = global_data_dict[directory]
             ax = axes[i]
 
             # Extract data for plotting
             num_points = list(values.keys())
             tri_distances = [values[n][0] / HER2_PATCH_SIZE for n in num_points]  # proportion out of 13px patch
             area_proportions = [values[n][1] for n in num_points]
-            rigid_distances = [rigid_values[n] / HER2_PATCH_SIZE for n in num_points]  # proportion out of 13px patch
+            global_distances = [global_values[n] / HER2_PATCH_SIZE for n in num_points]  # proportion out of 13px patch
 
             # Plot distance on the left y-axis
             ax.plot(num_points, tri_distances, color='blue', marker='o', label='Tri Distance')
-            ax.plot(num_points, rigid_distances, color='green', marker='o', label='Rigid Distance')
+            ax.plot(num_points, global_distances, color='green', marker='o', label='Global Distance')
 
             # Create secondary y-axis for area proportion
             ax2 = ax.twinx()
@@ -652,14 +821,14 @@ def show_mean_dist_area_prop(rigid_data_dict: dict, avg_dirs: bool = False, show
         # Add shared axis labels
         fig.text(0.5, 0.04, 'Number of Chosen Points', ha='center', fontsize=14)
         fig.text(0.03, 0.5, f'Triangulation Distance (proportion out of {HER2_PATCH_SIZE}px patch)', va='center', ha='center', color='blue', rotation='vertical', fontsize=14)
-        fig.text(0.06, 0.5, f'Rigid Distance (proportion out of {HER2_PATCH_SIZE}px patch)', va='center', ha='center', color='green',
+        fig.text(0.06, 0.5, f'Global Distance (proportion out of {HER2_PATCH_SIZE}px patch)', va='center', ha='center', color='green',
                  rotation='vertical', fontsize=14)
         fig.text(0.96, 0.5, 'Area Proportion', va='center', ha='center', color='red', rotation='vertical', fontsize=14)
 
         plt.show()
 
     else:
-        rigid_distances, tri_distances = {}, {}
+        global_distances, tri_distances = {}, {}
         if show_area:
             area_proportions = {}
         # Setup the figure with two columns of subplots
@@ -668,8 +837,8 @@ def show_mean_dist_area_prop(rigid_data_dict: dict, avg_dirs: bool = False, show
 
         # Plot each directory's data
         # for i, (directory, values) in enumerate(tri_data_dict.items()):
-        for i, (directory, values) in enumerate(rigid_data_dict.items()):
-            # rigid_values = rigid_data_dict[directory]
+        for i, (directory, values) in enumerate(global_data_dict.items()):
+            # global_values = global_data_dict[directory]
 
             # Extract data for plotting
             num_points = list(values.keys())
@@ -687,17 +856,17 @@ def show_mean_dist_area_prop(rigid_data_dict: dict, avg_dirs: bool = False, show
                 #     #     else tri_distances[n].append((values[n] - values[MIN_OUTER_POINTS]) / HER2_PATCH_SIZE)
                 #     pass
 
-                if n not in rigid_distances:
-                    rigid_distances[n] = []
-                rigid_distances[n].append(values[n] / HER2_PATCH_SIZE) if n == MIN_OUTER_POINTS \
-                        else rigid_distances[n].append((values[n] - values[MIN_OUTER_POINTS]) / HER2_PATCH_SIZE)
+                if n not in global_distances:
+                    global_distances[n] = []
+                global_distances[n].append(values[n] / HER2_PATCH_SIZE) if n == MIN_OUTER_POINTS \
+                        else global_distances[n].append((values[n] - values[MIN_OUTER_POINTS]) / HER2_PATCH_SIZE)
 
         # num_points = list(tri_distances.keys())
-        num_points = list(rigid_distances.keys())
+        num_points = list(global_distances.keys())
         # for k in tri_distances.keys():
-        for k in rigid_distances.keys():
+        for k in global_distances.keys():
             # tri_distances[k] = np.mean(tri_distances.get(k))
-            rigid_distances[k] = np.mean(rigid_distances.get(k))
+            global_distances[k] = np.mean(global_distances.get(k))
             if show_area:
                 area_proportions[k] = np.mean(area_proportions.get(k))
 
@@ -706,7 +875,7 @@ def show_mean_dist_area_prop(rigid_data_dict: dict, avg_dirs: bool = False, show
 
         # Plot distance on the left y-axis
         # ax.plot(num_points, [tri_distances[n] if n == MIN_OUTER_POINTS else tri_distances[MIN_OUTER_POINTS] + tri_distances[n] for n in tri_distances], color='blue', marker='o', label='Tri Distance')
-        ax.plot(num_points, [rigid_distances[n] if n == MIN_OUTER_POINTS else rigid_distances[MIN_OUTER_POINTS] + rigid_distances[n] for n in rigid_distances], color='green', marker='o', label='Rigid Distance')
+        ax.plot(num_points, [global_distances[n] if n == MIN_OUTER_POINTS else global_distances[MIN_OUTER_POINTS] + global_distances[n] for n in global_distances], color='green', marker='o', label='Global Distance')
         plt.legend()
 
         if show_area:
@@ -718,7 +887,7 @@ def show_mean_dist_area_prop(rigid_data_dict: dict, avg_dirs: bool = False, show
         fig.text(0.5, 0.04, 'Number of Chosen Points', ha='center', fontsize=14)
         # fig.text(0.03, 0.5, f'Triangulation Distance (proportion out of {HER2_PATCH_SIZE}px patch)', va='center',
         #          ha='center', color='blue', rotation='vertical', fontsize=14)
-        fig.text(0.06, 0.5, f'Rigid Distance (proportion out of {HER2_PATCH_SIZE}px patch)', va='center', ha='center',
+        fig.text(0.06, 0.5, f'Global Distance (proportion out of {HER2_PATCH_SIZE}px patch)', va='center', ha='center',
                  color='green',
                  rotation='vertical', fontsize=14)
         if show_area:
@@ -796,20 +965,20 @@ def rotate_back_annotation_img(im_Her2: np.array, im_Her2_copy: np.array, displa
     return im_Her2
 
 
-def match_landmarks(S_land_HE_3d: np.array, S_land_Her2_3d: np.array, display: bool = False):
-    # Find rigid transformation using ICP
+def match_landmarks(args, slide_ctx):
+    # Find global transformation using ICP
     trnsfrm_fitness = 0
     max_dist = math.inf
-    curr_icp_thresh = 500
-    th_pixels = 80
+    curr_icp_thresh = INIT_ICP_MATCH_THRESHOLD
+    th_pixels = UPPER_PAIR_DIST_THRESHOLD
     best_trnsfrm = None
     has_duplicates = True
 
     mappings, max_dists, best_trnsfrms, tirs, trnsltns = [], [], [], [], []
-    while (trnsfrm_fitness < 0.9 or max_dist > th_pixels or has_duplicates) and curr_icp_thresh > 50:
-        curr_icp_thresh -= 50
-        best_results = find_and_apply_best_trnsfrm(S_land_HE_3d=S_land_HE_3d, S_land_Her2_3d=S_land_Her2_3d,
-                                                   icp_threhold=curr_icp_thresh, display=display)
+    while (trnsfrm_fitness < FITNESS_THRESHOLD or max_dist > th_pixels or has_duplicates) and curr_icp_thresh > MIN_ICP_MATCH_THRESHOLD:
+        curr_icp_thresh -= ICP_MATCH_THRESHOLD_STEP
+        best_results = find_and_apply_best_trnsfrm(S_land_HE_3d=slide_ctx.S_land_HE_3d, S_land_Her2_3d=slide_ctx.S_land_Her2_3d,
+                                                   icp_threhold=curr_icp_thresh, display=args.display)
 
         S_land_HE_transformed, trnsfrm_fitness, best_trnsfrm = best_results[0], best_results[1], best_results[3]
         trans_init_rotated, translation = best_results[4], best_results[5]
@@ -819,7 +988,7 @@ def match_landmarks(S_land_HE_3d: np.array, S_land_Her2_3d: np.array, display: b
         # knn.fit(S_land_Her2_transformed[:, :2])
         knn.fit(S_land_HE_transformed[:, :2])
         # HE_Her2_land_mapping = knn.kneighbors(S_land_HE_3d[:, :2], return_distance=False).flatten()
-        HE_Her2_land_mapping = knn.kneighbors(S_land_Her2_3d[:, :2], return_distance=False).flatten()
+        HE_Her2_land_mapping = knn.kneighbors(slide_ctx.S_land_Her2_3d[:, :2], return_distance=False).flatten()
         mappings.append(HE_Her2_land_mapping)
         best_trnsfrms.append(best_trnsfrm)
         tirs.append(trans_init_rotated)
@@ -830,7 +999,7 @@ def match_landmarks(S_land_HE_3d: np.array, S_land_Her2_3d: np.array, display: b
 
         # Calculate the Euclidean distance between corresponding landmarks
         # pairs_dist = np.sqrt(np.sum((S_land_Her2_transformed[HE_Her2_land_mapping] - S_land_HE_3d) ** 2, axis=1))
-        pairs_dist = np.sqrt(np.sum((S_land_HE_transformed[HE_Her2_land_mapping] - S_land_Her2_3d) ** 2, axis=1))
+        pairs_dist = np.sqrt(np.sum((S_land_HE_transformed[HE_Her2_land_mapping] - slide_ctx.S_land_Her2_3d) ** 2, axis=1))
         max_dist = np.max(pairs_dist)
         max_dists.append(max_dist)
         print(f'max pair dist: {max_dist:.3f}')
@@ -846,14 +1015,25 @@ def match_landmarks(S_land_HE_3d: np.array, S_land_Her2_3d: np.array, display: b
     return HE_Her2_land_mapping, pairs_dist, best_trnsfrm, trans_init_rotated, translation
 
 
-def init_dist_dict(dict_json_path: str):
-    if os.path.exists(dict_json_path):
-        with open(dict_json_path, 'r') as f:
-            dist_dict = json.load(f)
-    else:
-        dist_dict = {}
+def init_dist_dict(args):
+    args.global_dist_path = os.path.join(args.root, f'{args.dict_name}.json')
 
-    return dist_dict
+    if os.path.exists(args.global_dist_path):
+        with open(args.global_dist_path, 'r') as f:
+            global_dist_dict = json.load(f)
+    else:
+        global_dist_dict = {}
+
+    if args.use_triangulation:
+        args.tri_dist_path = os.path.join(args.root, 'tri_one_out_LS.json')
+        if os.path.exists(args.tri_dist_path):
+            with open(args.tri_dist_path, 'r') as f:
+                tri_dist_dict = json.load(f)
+        else:
+            tri_dist_dict = {}
+
+    args.global_dist_dict = global_dist_dict
+    args.tri_dist_dict = tri_dist_dict
 
 def parse_thumb_names(png_images: list):
     # extract the 4-digit prefix (after removing optional "copy_")
@@ -882,150 +1062,47 @@ def parse_thumb_names(png_images: list):
 
 
 def main():
-    # Argument parser
-    parser = argparse.ArgumentParser(description="Match pairs of thumbnails through a mapping matrix.")
-    parser.add_argument('-r', '--root', default=os.path.join('slides_to_amit2', 'match_thumbs_HE_Her2', 'Marked', 'png_thumb_pairs_karin'), help='Root directory to search for thumbnail pairs.')
-    parser.add_argument('-dn', '--dict_name', type=str, default='rigid_one_out_LS', help='Name for the distance dictionary saved.')
-    parser.add_argument('-d', '--display', action='store_true', default=False, help='Whether to display images and plots during processing.')
-    parser.add_argument('-ut', '--use_triangulation', action='store_true', default=False, help='Whether to match using Delunay triangulation.')
-
-    args = parser.parse_args()
+    args = parse_args()
     print(f'args = {args}')
-    
-    marked_folder_path = os.path.join('slides_to_amit2', 'match_thumbs_HE_Her2', 'Marked', 'png_thumb_pairs_karin')
-    
-    # tri_dist_path = os.path.join(marked_folder_path, 'tri_one_out_LS.json')
-    rigid_dist_path = os.path.join(marked_folder_path, f'{args.dict_name}.json')
+        
+    init_dist_dict(args)
 
+    dirs_to_iterate = os.listdir(args.root)
 
-    # tri_dist, rigid_dist = init_dist_dict(tri_dist_path), init_dist_dict(rigid_dist_path)
-    rigid_dist = init_dist_dict(rigid_dist_path)
-
-    dirs_to_iterate = os.listdir(marked_folder_path)
     try:
         for _, dir in tqdm(dirs_to_iterate, total=len(dirs_to_iterate)):
             print(f'dir = {dir}')
             # if dir in tri_dist:
-            # if dir in rigid_dist and dir != '19-9595_1_1':  #
+            # if dir in args.global_dist_dict and dir != '19-9595_1_1':  #
             #     print(f'Directory already done')
             #     continue
             # if dir != '19-9595_1_1':
             #     continue
-
-            # Initialize paths
-            folder = os.path.join(marked_folder_path, dir)
-            if not os.path.isdir(folder):
-                print(f'{dir} is not a directory')
-                continue
-
-            png_images = list(filter(lambda x: x.endswith('.png') and not x.startswith('map') and not x.startswith('Transformed'), os.listdir(folder)))
-            if len(png_images) < EXPECTED_THUMBS:
-                # tri_dist[dir] = 'Directory does not contain enough images'
-                rigid_dist[dir] = 'Directory does not contain enough images'
-                print('Directory does not contain enough images')
-                continue
-
-            thumb_HE, thumb_Her2, thumb_Her2_copy = parse_thumb_names(png_images=png_images)
-
-            im_HE, im_Her2, im_Her2_copy, output_mapping_file = load_and_display_thumbs(folder_path=folder, HE_thumb_name=thumb_HE, Her2_thumb_name=thumb_Her2,
-                                                                                        Her2_thumb_copy_name=thumb_Her2_copy, display=args.display)
-
-            im_Her2 = rotate_back_annotation_img(im_Her2=im_Her2, im_Her2_copy=im_Her2_copy, display=args.display)
-            if type(im_Her2) is int:
-                rigid_dist[dir] = 'Could not rotate Her2 image back to original orientation'
-                continue
-
-            # Find landmarks
-            landmark_color = np.array(LANDMARK_COLOR).astype(np.float32)
-
+            
             try:
-                if dir in rigid_dist:
-                    rigid_dist.pop(dir)
-                S_land_HE, S_land_Her2 = landmark_detection(im_HE=im_HE, im_Her2=im_Her2, landmark_color=landmark_color, display=args.display)
-                if len(S_land_HE) == 0:  # try other landmark color (black)
-                    S_land_HE, S_land_Her2 = landmark_detection(im_HE=im_HE, im_Her2=im_Her2, landmark_color=np.array([0.0, 0.0, 0.0]))
-            except ValueError as e:
-                rigid_dist[dir] = str(e)
-                print(e)
+                slide_ctx = prepare_slide_context(args=args, dir=dir)
+                process_slide(args=args, slide_ctx=slide_ctx)
+
+            except Exception as e:
+                print(f"Failed processing " f"{row['SlideName']}:\n{e}")
+
                 continue
 
-            if len(S_land_HE) < MIN_LANDMARKS:
-                rigid_dist[dir] = f'Insufficient landmark count: {len(S_land_HE)}'
-                print(f'Insufficient landmark count: {len(S_land_HE)}')
-                continue
-
-            pts_moving = S_land_HE / 2  # HE thumbs were created twice the size of the Her2 thumbs for some reason
-            pts_fixed = S_land_Her2
-
-            S_land_HE_3d = np.hstack([pts_moving, np.zeros((len(S_land_HE), 1))])  # For point cloud
-            S_land_Her2_3d = np.hstack([pts_fixed, np.zeros((len(S_land_Her2), 1))])
-
-            if args.display:
-                plot_landmarks(S_land_HE_3d[:, [1, 0, 2]], S_land_Her2_3d[:, [1, 0, 2]],
-                               f'Initial H&E Landmarks - {dir}', 'Her2 Landmarks')
-
-            HE_Her2_land_mapping, pairs_dist, best_trnsfrm, trans_init_rotated, translation = match_landmarks(S_land_HE_3d=S_land_HE_3d, S_land_Her2_3d=S_land_Her2_3d, display=args.display)
-
-            # Check for duplicate elements
-            _, counts = np.unique(HE_Her2_land_mapping, return_counts=True)
-            has_duplicates = np.any(counts > 1)
-            if has_duplicates:
-                rigid_dist[dir] = f"HE_Her2_land_mapping has correspondence overlap: {HE_Her2_land_mapping}"
-                print(f"HE_Her2_land_mapping has correspondence overlap: {HE_Her2_land_mapping}")
-                continue
-
-            # Mapping for H&E and Her2
-            PT_HE = S_land_HE[HE_Her2_land_mapping]
-            PT_Her2 = S_land_Her2
-
-            inner_points_mask = get_inner_hull_point_mask(points=PT_HE)
-
-            for i in np.arange(PT_HE.shape[0]):
-                metric_point_index = i
-                inner_points_indices = np.where(inner_points_mask)[0]
-                curr_tri_dist, curr_rigid_dist = evaluate_w_sub_group(PT_HE=PT_HE, PT_Her2=PT_Her2, im_HE=im_HE, im_Her2=im_Her2, S_land_HE_3d=S_land_HE_3d,
-                                                                      S_land_Her2_3d=S_land_Her2_3d, HE_Her2_land_mapping=HE_Her2_land_mapping,
-                                                                      inner_points_indices=inner_points_indices, metric_point_index=metric_point_index)
-                if dir not in rigid_dist:
-                    # tri_dist[dir] = curr_tri_dist
-                    rigid_dist[dir] = curr_rigid_dist
-                else:
-                    for k in rigid_dist[dir].keys():
-                        rigid_dist[dir][k] = np.hstack((rigid_dist[dir][k], curr_rigid_dist[k]))
-
-            for k in rigid_dist[dir].keys():
-                rigid_dist[dir][k] = np.mean(rigid_dist[dir][k])
-
-            im_map = create_rigid_map(PT_HE=PT_HE, PT_Her2=PT_Her2, im_HE=im_HE, im_Her2=im_Her2, dir_name=dir, base_path=marked_folder_path)
-            # im_map = triangulate_and_create_map(PT_HE=PT_HE, PT_Her2=PT_Her2, im_HE=im_HE, im_Her2=im_Her2)
-
-            img_16bit = im_map.astype(np.uint16)
-            # Now we can use cv2.cvtColor
-            bgr_im_map = cv2.cvtColor(img_16bit, cv2.COLOR_RGB2BGR)
-
-            cv2.imwrite(output_mapping_file, bgr_im_map)
-            print(f'saved mapping file to {output_mapping_file}')
-
-            # Verify the saved file
-            im_map_uint16_rec = cv2.imread(output_mapping_file, cv2.IMREAD_UNCHANGED)
-            if not np.array_equal(bgr_im_map, im_map_uint16_rec):
-                print("Warning: The saved mapping file does not match the original.")
-
-        dist_to_plot = {key: value for key, value in rigid_dist.items() if not isinstance(value, str)}
-        issue_dirs = {key: value for key, value in rigid_dist.items() if isinstance(value, str)}
-        print(f"Number of dirs: {len(rigid_dist.keys())}")
+        dist_to_plot = {key: value for key, value in args.global_dist_dict.items() if not isinstance(value, str)}
+        issue_dirs = {key: value for key, value in args.global_dist_dict.items() if isinstance(value, str)}
+        print(f"Number of dirs: {len(args.global_dist_dict.keys())}")
         print(issue_dirs)
-        # show_dist_plot(tri_dist=tri_dist, rigid_dist=rigid_dist)
-        show_mean_dist_area_prop(rigid_data_dict=dist_to_plot, avg_dirs=True)
-        show_dist_hist(rigid_dist=dist_to_plot)
+        # show_dist_plot(tri_dist=tri_dist, global_dist=global_dist)
+        show_mean_dist_area_prop(global_data_dict=dist_to_plot, avg_dirs=True)
+        show_dist_hist(global_data_dict=dist_to_plot)
 
     except BaseException as e:
         traceback.print_exc()
     finally:
         # with open(tri_dist_path, "w") as f:
         #     json.dump(tri_dist, f, indent=4)
-        with open(rigid_dist_path, "w") as f:
-            json.dump(rigid_dist, f, indent=4)
+        with open(args.global_dist_path, "w") as f:
+            json.dump(args.global_dist_dict, f, indent=4)
 
 
 if __name__ == "__main__":

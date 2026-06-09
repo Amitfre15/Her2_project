@@ -415,9 +415,9 @@ def load_tumor_indices(args, slide_ctx):
             raise ValueError(f"No y prediction file found in {slide_ctx.paths.y_pred_folder}, probably no tumor indices were found. Skipping...")
         slide_ctx.paths.y_pred_file=os.path.join(slide_ctx.paths.y_pred_folder, y_pred_npy)
         slide_ctx.y_pred_fold = y_pred_npy.split('val')[-1].split('.')[0]  # extract fold from filename like tile_y_pred_val1.npy
-        ti = slide_ctx.paths.ti.replace(f'tumor_indices.npy', f'tumor_indices{fold}.npy')
+        ti = slide_ctx.paths.ti.replace(f'tumor_indices.npy', f'tumor_indices{slide_ctx.y_pred_fold}.npy')
         slide_ctx.tumor_indices = np.load(ti).astype(int) if os.path.exists(ti) else None
-        tile_y_npy = next(filter(lambda f: f'val{fold}' in f, os.listdir(slide_ctx.paths.tile_y_folder)), None)
+        tile_y_npy = next(filter(lambda f: f'val{slide_ctx.y_pred_fold}' in f, os.listdir(slide_ctx.paths.tile_y_folder)), None)
         y_file = os.path.join(slide_ctx.paths.tile_y_folder, tile_y_npy)
         slide_ctx.tile_y = np.load(y_file).flatten() if os.path.exists(y_file) else None
     elif not args.her2_annotations:
@@ -1349,8 +1349,8 @@ def main():
     slides_df = metadata["slides_df"]
 
     for _, row in tqdm(slides_df.iterrows(), total=len(slides_df)):
-        if '19-14590' not in row['SlideName']:
-            continue
+        # if '19-14590' not in row['SlideName']:
+        #     continue
         try:
             slide_ctx = prepare_slide_context(args=args, row=row, paths=paths, metadata=metadata)
             process_slide(args=args, slide_ctx=slide_ctx, collectors=collectors)

@@ -80,8 +80,8 @@ class Collectors:
 def parse_args():
     # Argument parser
     parser = argparse.ArgumentParser(description="Process slides through thumbs and mapping matrices.")
-    parser.add_argument('-scsv', '--slides_excel_path', default="/home/amitf/workspace/WSI/metadata_csvs/Her2_slides_matched_HE_folds.csv", type=str, help='Path to matched CSV file'))  
-    parser.add_argument('-tdfsp', '--tile_df_save_path', default="/home/amitf/workspace/WSI/metadata_csvs/Tile_samples.csv", type=str, help='Path to save the tile df'))
+    parser.add_argument('-scsv', '--slides_excel_path', default="/home/amitf/workspace/WSI/metadata_csvs/Her2_slides_matched_HE_folds.csv", type=str, help='Path to matched CSV file')
+    parser.add_argument('-tdfsp', '--tile_df_save_path', default="/home/amitf/workspace/WSI/metadata_csvs/Tile_samples.csv", type=str, help='Path to save the tile df')
     parser.add_argument('-tmpp', '--target_mpp', type=float, help='Target tiles MPP', default=1, choices=[0.5, 1, 2], required=True)
     parser.add_argument('-folds', '--folds', type=str, help='Fold to filter', default='', choices=['1', '2', '3', '4', '5', '6'])
     parser.add_argument('-ofa', '--only_first_annotated', action='store_true', help='Only use the first annotated slides')
