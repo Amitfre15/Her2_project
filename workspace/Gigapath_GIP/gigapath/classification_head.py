@@ -549,32 +549,6 @@ class TileClassificationHead(nn.Module):
                 return logits, tile_logits, tile_log_vars
 
 
-class Her2ResNet(nn.Module):
-    def __init__(self, num_outputs=2):
-        """
-        num_outputs = 1  -> regression
-        num_outputs = 2  -> classification
-        """
-        super().__init__()
-
-        # -------- Backbone (no pretraining) --------
-        self.backbone = models.resnet18(weights=None)
-        # self.backbone = models.mobilenet_v2(weights=None)
-
-        # Replace final FC layer
-        in_features = self.backbone.fc.in_features
-        # in_features = self.backbone.classifier[1].in_features
-        # self.backbone.classifier = nn.Sequential(
-        self.backbone.fc = nn.Sequential(
-            nn.Linear(in_features, 128),
-            nn.ReLU(inplace=True),
-            nn.Dropout(p=0.5),
-            nn.Linear(128, num_outputs)
-        )
-
-    def forward(self, x):
-        return self.backbone(x)
-
 # Linear regression from slide scores and clinical features to slide label
 class LinearClassificationHead(nn.Module):
     def __init__(self, input_dim, n_classes=2, **kwargs):
@@ -589,10 +563,7 @@ class LinearClassificationHead(nn.Module):
 
 
 def get_model(**kwargs):
-    if kwargs["cnn_on_y"]:
-        model = Her2ResNet()
-        print(f'model = Her2ResNet')
-    elif kwargs["train_on_y"] and not kwargs["pred_y_baseline"]:
+    if kwargs["train_on_y"] and not kwargs["pred_y_baseline"]:
         model = TileClassificationHead(**kwargs)
         print(f'model = TileClassificationHead')
     elif kwargs["score_can_as_sb"] or kwargs["score_can_as_bs"] or kwargs["film"] or kwargs["weighted_film"]:

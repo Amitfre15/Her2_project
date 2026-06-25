@@ -13,23 +13,12 @@ from tqdm import tqdm
 from datasets.slide_datatset import SlidingWindowDataset
 from params import get_finetune_params
 from task_configs.utils import load_task_config
-from utils import get_test_loader
+from utils import get_test_loader, HE_THUMB_HEIGHT, HE_THUMB_WIDTH, IHC_THUMB_HEIGHT, IHC_THUMB_WIDTH, SLIDE_HEIGHT, SLIDE_WIDTH, SLIDE_MPP, SLIDE_PATCH_SIZE
 from typing import List, Tuple, Optional, Any, Dict
 from dataclasses import dataclass
 
 
 OPENSLIDE_PATH = r"C:\Program Files\openslide-bin-4.0.0.3-windows-x64\openslide-bin-4.0.0.3-windows-x64\bin"
-# DESIRED_MPP = 0.5
-# DESIRED_MPP = 1
-# DESIRED_MPP = 2
-SLIDE_PATCH_SIZE = 256
-SLIDE_MPP = 0.242797397769517
-SLIDE_HEIGHT = 204614
-SLIDE_WIDTH = 89484
-HE_THUMB_HEIGHT = 10230
-HE_THUMB_WIDTH = 4473
-IHC_THUMB_HEIGHT = 5115
-IHC_THUMB_WIDTH = 2237
 SEG_THUMB_HEIGHT = 97
 SEG_THUMB_WIDTH = 42
 IHC_SCALE_PATCH_SIZE = round(SLIDE_PATCH_SIZE * (IHC_THUMB_WIDTH / SLIDE_WIDTH) / 0.25)
@@ -296,11 +285,12 @@ def save_matching_tiles(args, slide_context: SlideContext, collectors: Collector
                           'fold': slide_context.fold, 'patient_id': slide_context.patient_id, 'HE_tile_path': os.path.join(slide_context.paths.full_tiles_dir, tile),
                           'HE_features_path': os.path.join(slide_context.paths.full_tiles_dir.replace('png_tiles', 'gigapath_features'), f'tile_embeds_{dir}.npy'), 
                           'HE_features_tile_index': he_idx} if args.create_samples_csv else None                    
-            ihc_tile_index = find_matching_score(tile_name=tile, slide_context=slide_context, find_tile=args.matching_tile, tiles=tiles, tile_df_row=tile_df_row, 
-                                                    target_mpp=args.target_mpp)
+            ihc_tile_index = find_matching_score(tile_name=tile, slide_context=slide_context, find_tile=args.matching_tile, tiles=tiles, tile_df_row=tile_df_row, target_mpp=args.target_mpp)
             matching_indices.append(ihc_tile_index)
+
             if ihc_tile_index is not None and tile_df_row: # documenting matching indices to a file
-                tile_df_row['IHC_features_path'], tile_df_row['IHC_features_tile_index'] = os.path.join(slide_context.paths.labels_path.replace('tile_labels', 'gigapath_features'), slide_dir, f'tile_embeds_{slide_dir}.npy'), ihc_tile_index
+                tile_df_row['IHC_features_path'] = os.path.join(slide_context.paths.labels_path.replace('tile_labels', 'gigapath_features'), slide_dir, f'tile_embeds_{slide_dir}.npy')
+                tile_df_row['IHC_features_tile_index'] = ihc_tile_index
                 tile_df_row['IHC_tile_path'] = os.path.join(ihc_tiles_dir, tile_df_row['IHC_tile'])
                 collectors.tile_df.loc[len(collectors.tile_df)] = tile_df_row
                 if len(collectors.tile_df) % 500 == 0:
