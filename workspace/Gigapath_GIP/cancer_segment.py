@@ -1352,8 +1352,8 @@ def main():
     slides_df = metadata["slides_df"]
 
     for _, row in tqdm(slides_df.iterrows(), total=len(slides_df)):
-        if '19-14590' not in row['SlideName']:
-            continue
+        # if '19-14590' not in row['SlideName']:
+        #     continue
         try:
             slide_ctx = prepare_slide_context(args=args, row=row, paths=paths, metadata=metadata)
             process_slide(args=args, slide_ctx=slide_ctx, collectors=collectors)

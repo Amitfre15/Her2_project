@@ -1215,8 +1215,8 @@ def evaluate(loader, model, fp16_scaler, loss_fn, epoch, args, save_embed=False)
             max_num_samples = 1000
         for batch_idx, batch in enumerate(loader):
             slide_id = batch['slide_id'][-1] 
-            if not slide_id.startswith('19-14590_1_1'):
-                continue
+            # if not slide_id.startswith('19-14590_1_1'):
+            #     continue
             # if batch_idx > 3:
             #     break
 
