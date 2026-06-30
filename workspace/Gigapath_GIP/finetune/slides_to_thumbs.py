@@ -70,8 +70,10 @@ def parse_args():
     # Argument parser
     parser = argparse.ArgumentParser(description="Process slides through thumbs and mapping matrices.")
     parser.add_argument('-scsv', '--slides_excel_path', default="/home/amitf/workspace/WSI/metadata_csvs/Her2_slides_matched_HE_folds.csv", type=str, help='Path to matched CSV file')
+    parser.add_argument('-mmd', '--map_matrix_dir', default=os.path.join(os.sep, "SSDStorage", "Breast", "Carmel", "png_thumb_pairs_karin"), type=str, help='Path to the directory containing map matrices')
+    parser.add_argument('-he_tp', '--he_tiles_path', default=os.path.join(os.sep, "SSDStorage", "Breast", "Carmel", "Her2", "gigapath_HE", f"png_tiles_mpp0.5"), type=str, help='Path to the directory containing HE tiles')
     parser.add_argument('-tdfsp', '--tile_df_save_path', default="/home/amitf/workspace/WSI/metadata_csvs/Tile_samples.csv", type=str, help='Path to save the tile df')
-    parser.add_argument('-tmpp', '--target_mpp', type=float, help='Target tiles MPP', default=1, choices=[0.5, 1, 2], required=True)
+    parser.add_argument('-tmpp', '--target_mpp', type=float, help='Target tiles MPP', default=0.5, choices=[0.5, 1, 2], required=True)
     parser.add_argument('-folds', '--folds', type=str, help='Fold to filter', default='', choices=['1', '2', '3', '4', '5', '6'])
     parser.add_argument('-ofa', '--only_first_annotated', action='store_true', help='Only use the first annotated slides')
     parser.add_argument('-mt', '--matching_tile', action='store_true', help='Whether to find the matching tile or the matching score for each HE tile')
@@ -102,9 +104,9 @@ def build_paths(args):
     return Paths(
         slides_excel_path=args.slides_excel_path,
         tile_df_save_path=args.tile_df_save_path,
-        map_matrix_dir = os.path.join(os.sep, "SSDStorage", "Breast", "Carmel", "png_thumb_pairs_karin"),
+        map_matrix_dir = args.map_matrix_dir,
         score_matrix_dir = os.path.join(os.sep, "home", "amitf", "outputs", "SW_IHC_to_Her2_score", "her2"),
-        tiles_path = os.path.join(os.sep, "SSDStorage", "Breast", "Carmel", "Her2", "gigapath_HE", f"png_tiles{args.suffix}"),
+        tiles_path = args.he_tiles_path.replace("png_tiles_mpp0.5", f"png_tiles{args.suffix}"),
         labels_path = os.path.join(os.sep, "SSDStorage", "Breast", "Carmel", "Her2", "gigapath_IHC", f"tile_labels{args.suffix}"),
     )
 
@@ -118,7 +120,7 @@ def load_metadata(args):
         df = df[(df["Path"].str.contains("Batch_1", case=False, na=False)) | (df["Path"].str.contains("Batch_2", case=False, na=False))]
     if args.folds:
         df = df[df["fold"] == int(args.folds)]
-    df = df[["SlideName", "Matched_HE_SlideName", "fold", "label", "patient barcode", "label"]]
+    df = df[["SlideName", "Matched_HE_SlideName", "fold", "patient barcode", "label"]]
     df["SlideName"] = df["SlideName"].apply(lambda x: x.split('.')[0])
     df["Matched_HE_SlideName"] = df["Matched_HE_SlideName"].apply(lambda x: x.split('.')[0])
     df["block"] = df["Matched_HE_SlideName"].str.extract(r'(^[\d-]+_\d+_\d+)')

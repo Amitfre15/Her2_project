@@ -400,138 +400,6 @@ def test(test_loader, args):
     wandb.finish() if "wandb" in args.report_to else None
     return test_records
 
-def train_cycleGAN(dataloader, fold, args):
-    train_loader, val_loader, test_loader = dataloader
-
-    G_HE_IHC = ResNetGenerator().to(args.device)
-    G_IHC_HE = ResNetGenerator().to(args.device)
-    D_HE = PatchDiscriminator().to(args.device)
-    D_IHC = PatchDiscriminator().to(args.device)
-    cnn = torchvision.models.squeezenet1_1(pretrained=True).features.to(args.device)
-    cnn.eval()
-    for param in cnn.parameters():
-        param.requires_grad = False
-
-    opt_G = torch.optim.Adam(list(G_HE_IHC.parameters()) + list(G_IHC_HE.parameters()), lr=2e-4, betas=(0.5, 0.999))
-    opt_D_HE = torch.optim.Adam(D_HE.parameters(), lr=2e-4, betas=(0.5, 0.999))
-    opt_D_IHC = torch.optim.Adam(D_IHC.parameters(), lr=2e-4, betas=(0.5, 0.999))
-
-    criterion_GAN = nn.MSELoss()
-    criterion_cycle = criterion_color = nn.L1Loss()
-    real_label = 1.0
-    fake_label = 0.0
-    tile_bsz = 16
-    style_layers = (1, 4, 6, 7)
-    style_weights = (0.2, 0.005, 0.0002, 0.00001)
-
-    for epoch in range(args.epochs):
-        for batch_idx, batch in enumerate(tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs}")):
-            tiles, label, slide_id = batch['tiles'].squeeze(0), batch['labels'], batch['slide_id'][-1]
-            print(f'batch_idx = {batch_idx}, slide_id = {slide_id}, label = {label}')            
-            ihc_tiles, matching_tiles = batch['ihc_tiles'].squeeze(0), batch['matching_tiles'].squeeze(0) # Delete
-            print(f'tiles.shape = {tiles.shape}, ihc_tiles.shape = {ihc_tiles.shape}, matching_tiles.shape = {matching_tiles.shape}') # Delete
-            valid_matching_tiles = (~torch.isnan(matching_tiles)) & (matching_tiles < ihc_tiles.shape[0])
-            if len(torch.nonzero(valid_matching_tiles)) == 0:
-                print(f"{batch['slide_id']} has no valid matching tiles, skipping")
-                continue
-            # Select only valid matching tiles
-            tiles = tiles[valid_matching_tiles]
-            matching_tiles = matching_tiles[valid_matching_tiles].int()
-            ihc_tiles = ihc_tiles[matching_tiles]
-
-            for i in range(0, len(tiles), tile_bsz):
-                curr_tiles = tiles[i:i+tile_bsz]
-                curr_ihc_tiles = ihc_tiles[i:i+tile_bsz]
-
-                real_HE = curr_tiles.to(args.device)
-                real_IHC = curr_ihc_tiles.to(args.device)
-
-                # ====================
-                # Train Generators
-                # ====================
-                fake_IHC = G_HE_IHC(real_HE)
-                rec_HE = G_IHC_HE(fake_IHC)
-                fake_HE = G_IHC_HE(real_IHC)
-                rec_IHC = G_HE_IHC(fake_HE)
-
-                loss_idt_HE = criterion_cycle(G_IHC_HE(real_HE), real_HE)
-                loss_idt_IHC = criterion_cycle(G_HE_IHC(real_IHC), real_IHC)
-
-                pred_fake_IHC = D_IHC(fake_IHC)
-                loss_GAN_HE_IHC = criterion_GAN(pred_fake_IHC, torch.ones_like(pred_fake_IHC))
-
-                pred_fake_HE = D_HE(fake_HE)
-                loss_GAN_IHC_HE = criterion_GAN(pred_fake_HE, torch.ones_like(pred_fake_HE))
-
-                loss_cycle_HE = criterion_cycle(rec_HE, real_HE)
-                loss_cycle_IHC = criterion_cycle(rec_IHC, real_IHC)
-
-                # Compute style loss
-                style_loss_HE = style_loss(fake_HE, real_HE, style_layers, style_weights, cnn)
-                style_loss_IHC = style_loss(fake_IHC, real_IHC, style_layers, style_weights, cnn)
-
-                loss_G = (
-                    (style_loss_HE + style_loss_IHC) +
-                    loss_GAN_HE_IHC + loss_GAN_IHC_HE +
-                    10.0 * (loss_cycle_HE + loss_cycle_IHC) +
-                    5.0 * (loss_idt_HE + loss_idt_IHC)
-                )
-                # print(f"loss_color_HE = {loss_color_HE.item()}, loss_color_IHC = {loss_color_IHC.item()}")
-                print(f"style_loss_HE = {style_loss_HE.item()}, style_loss_IHC = {style_loss_IHC.item()}")
-                print(f"loss_GAN_HE_IHC = {loss_GAN_HE_IHC.item()}, loss_GAN_IHC_HE = {loss_GAN_IHC_HE.item()}")
-                print(f"loss_cycle_HE = {loss_cycle_HE.item()}, loss_cycle_IHC = {loss_cycle_IHC.item()}")
-                print(f"loss_idt_HE = {loss_idt_HE.item()}, loss_idt_IHC = {loss_idt_IHC.item()}")
-                print(f"loss_G = {loss_G.item()}")
-
-                opt_G.zero_grad()
-                loss_G.backward()
-                opt_G.step()
-
-                # ====================
-                # Train Discriminator A
-                # ====================
-                pred_real_HE = D_HE(real_HE)
-                pred_fake_HE = D_HE(fake_HE.detach())
-
-                loss_D_HE = (
-                    criterion_GAN(pred_real_HE, torch.ones_like(pred_real_HE)) +
-                    criterion_GAN(pred_fake_HE, torch.zeros_like(pred_fake_HE))
-                ) * 0.5
-
-                print(f"loss_D_HE = {loss_D_HE.item()}")
-
-                opt_D_HE.zero_grad()
-                loss_D_HE.backward()
-                opt_D_HE.step()
-
-                # ====================
-                # Train Discriminator B
-                # ====================
-                pred_real_IHC = D_IHC(real_IHC)
-                pred_fake_IHC = D_IHC(fake_IHC.detach())
-
-                loss_D_IHC = (
-                    criterion_GAN(pred_real_IHC, torch.ones_like(pred_real_IHC)) +
-                    criterion_GAN(pred_fake_IHC, torch.zeros_like(pred_fake_IHC))
-                ) * 0.5
-
-                print(f"loss_D_IHC = {loss_D_IHC.item()}")
-
-                opt_D_IHC.zero_grad()
-                loss_D_IHC.backward()
-                opt_D_IHC.step()
-
-        # Save outputs
-        os.makedirs(f"{args.save_dir}/samples", exist_ok=True)
-        save_image(fake_IHC[0] * 0.5 + 0.5, f"{args.save_dir}/samples/fake_IHC_epoch{epoch}_slide_{slide_id}.png")
-        save_image(fake_HE[0] * 0.5 + 0.5, f"{args.save_dir}/samples/fake_HE_epoch{epoch}_slide_{slide_id}.png")
-        save_image(real_IHC[0], f"{args.save_dir}/samples/real_IHC_epoch{epoch}_slide_{slide_id}.png")
-        save_image(real_HE[0], f"{args.save_dir}/samples/real_HE_epoch{epoch}_slide_{slide_id}.png")
-
-        # Save models
-        torch.save(G_HE_IHC.state_dict(), f"{args.save_dir}/G_HE_IHC_{epoch}.pth")
-        torch.save(G_IHC_HE.state_dict(), f"{args.save_dir}/G_IHC_HE_{epoch}.pth")
-
 
 def train_clinic_reg(dataloader, args):
     train_loader, val_loader, test_loader = dataloader
@@ -1347,8 +1215,8 @@ def evaluate(loader, model, fp16_scaler, loss_fn, epoch, args, save_embed=False)
             max_num_samples = 1000
         for batch_idx, batch in enumerate(loader):
             slide_id = batch['slide_id'][-1] 
-            # if not slide_id.startswith('19-14590_1_1'):
-            #     continue
+            if not slide_id.startswith('19-14590_1_1'):
+                continue
             # if batch_idx > 3:
             #     break
 
@@ -1608,7 +1476,7 @@ def evaluate(loader, model, fp16_scaler, loss_fn, epoch, args, save_embed=False)
                             matching_ihc_images = ihc_images.squeeze(0)[matching_tiles]
                             # to create y
                             if args.create_y:
-                                matching_ihc_images, img_coords = matching_ihc_images.unsqueeze(0).transpose(0, 1), img_coords.unsqueeze(0).transpose(0, 1)
+                                matching_ihc_images, img_coords = matching_ihc_images.unsqueeze(0).transpose(0, 1), img_coords.transpose(0, 1)
                                 print(f'matching_ihc_images.shape = {matching_ihc_images.shape}')
                                 if matching_ihc_images.shape[0] == 0:
                                     print(f"slide {batch['slide_id']} has no matching ihc images, skipping")
@@ -1720,7 +1588,7 @@ def evaluate(loader, model, fp16_scaler, loss_fn, epoch, args, save_embed=False)
                             matching_ihc_images = ihc_images.squeeze(0)[matching_tiles]
                             # to create y
                             if args.create_y:
-                                matching_ihc_images, img_coords = matching_ihc_images.unsqueeze(0).transpose(0, 1), img_coords.unsqueeze(0).transpose(0, 1)
+                                matching_ihc_images, img_coords = matching_ihc_images.unsqueeze(0).transpose(0, 1), img_coords.transpose(0, 1)
                                 print(f'matching_ihc_images.shape = {matching_ihc_images.shape}')
                                 if matching_ihc_images.shape[0] == 0:
                                     print(f"slide {batch['slide_id']} has no matching ihc images, skipping")

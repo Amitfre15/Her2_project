@@ -3,7 +3,7 @@ import torch
 import pandas as pd
 import numpy as np
 
-from training import train, test, generate_heatmap, run_window_inference, train_cycleGAN, train_clinic_reg, test_clinic_reg
+from training import train, test, generate_heatmap, run_window_inference, train_clinic_reg, test_clinic_reg
 from params import get_finetune_params
 from task_configs.utils import load_task_config
 from utils import seed_torch, get_exp_code, get_loader, save_obj, get_test_loader
@@ -11,11 +11,14 @@ from datasets.slide_datatset import SlideDataset, SlidingWindowDataset
 
 if __name__ == '__main__':
     # Set the hf token
-    with open("/home/amitf/workspace/Gigapath_GIP/finetune/hf_token.txt", "r") as file:
-        os.environ["HUGGINGFACE_HUB_TOKEN"] = file.read()
+    # with open("/home/amitf/workspace/Gigapath_GIP/finetune/hf_token.txt", "r") as file:
+    #     os.environ["HUGGINGFACE_HUB_TOKEN"] = file.read()
 
     args = get_finetune_params()
     print(args)
+
+    # Set the hf token
+    os.environ["HF_TOKEN"] = args.hf_token
 
     # set the device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

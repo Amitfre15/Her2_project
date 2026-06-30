@@ -16,7 +16,7 @@ from typing import List, Tuple, Optional, Any, Dict
 from dataclasses import dataclass, field
 
 # Local application imports
-from workspace.Gigapath_GIP.finetune.utils import (
+from finetune.utils import (
     parse_tile_name, correct_coords, slide_to_thumb_coord,
     thumb_to_slide_coord, load_npy_file, SLIDE_HEIGHT, SLIDE_WIDTH,
     SLIDE_MPP, SLIDE_PATCH_SIZE
@@ -107,9 +107,9 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Create and process score maps.")
 
     # Required
-    parser.add_argument("-s", "--save_path", required=True, type=str, help='Path to save tiles and embeds')
+    parser.add_argument("-s", "--save_path", required=True, type=str, help='Path to save score_maps')
     parser.add_argument("-e", "--excel_path", required=True, type=str, help='Path to Excel file')
-    parser.add_argument("-tmpp", "--target_mpp", required=True, type=float, choices=[0.5, 1, 2], help='Target tiles MPP')
+    parser.add_argument("-tmpp", "--target_mpp", required=True, type=float, default=0.5, choices=[0.5, 1, 2], help='Target tiles MPP')
 
     # Optional
     parser.add_argument("-mcsv", "--matched_csv_path", default="/home/amitf/workspace/WSI/metadata_csvs/Her2_slides_matched_HE_folds.csv", type=str, help='Path to matched CSV file')
@@ -136,11 +136,11 @@ def parse_args():
     parser.add_argument('-cypc', '--create_y_sw_bl_csv', action='store_true', default=False, help='Create csvs for y predictions')
     parser.add_argument('-y_std', '--y_std', action='store_true', default=False, help='Calculate standard deviation of tile_y')
     parser.add_argument('-reg_an', '--registration_annotated', action='store_true', default=False, help='filter annotated slides for registration')
-    parser.add_argument('-ad', '--all_data', action='store_true', default=False, help='Use all the data (annotated)')
+    parser.add_argument('-ad', '--all_data', action='store_true', default=True, help='Use all the data (annotated)')
     parser.add_argument('-cancer_an', '--cancer_annotations', action='store_true', default=False, help='process annotated slides for cancer classification')
     parser.add_argument('-her2_an', '--her2_annotations', action='store_true', default=False, help='process annotated slides for HER2 classification')
     parser.add_argument('-save_her2_an', '--save_her2_annotations', action='store_true', default=False, help='save HER2 annotations from segmentation map')
-    parser.add_argument('-seg_from_cp', '--seg_from_my_cancer_predictions', action='store_true', default=False, help='save tile cancer prediction map')
+    parser.add_argument('-seg_from_cp', '--seg_from_cancer_predictions', action='store_true', default=False, help='save tile cancer prediction map')
     parser.add_argument('-test_set', '--test_set', action='store_true', default=False, help='iterate only on test set')
     parser.add_argument('-y_map_fhe', '--y_map_from_he', action='store_true', default=False, help='extract tile y from y map constructed from HE slide')
     parser.add_argument('-aht', '--all_he_tiles', action='store_true', default=False, help='extract tile y from y map constructed from HE slide and use all HE tiles')
@@ -280,12 +280,15 @@ def resolve_segment_dir(args, paths, slide_name, matching_he_slide):
             paths.segment_dir = os.path.join(paths.save_path.replace('IHC', 'HE'), f'HER2_status_map{args.src_suffix}')
         slide_dir = next(filter(lambda x: x.startswith(matching_he_slide[:-1]), os.listdir(paths.segment_dir)), None)
         if slide_dir is None:
-            print(f"y_map directory for slide {matching_he_slide} not found. Skipping...")
-            # continue
-        paths.segment_dir = os.path.join(paths.segment_dir, slide_dir)
+            if args.extract_tile_y_from_y_map:
+                print(f"y_map directory for slide {matching_he_slide} not found. Skipping...")
+            else:
+                os.makedirs(os.path.join(paths.segment_dir, matching_he_slide[:-1]), exist_ok=True)
+        
+        paths.segment_dir = os.path.join(paths.segment_dir, matching_he_slide[:-1])
     elif (args.her2_annotations or args.save_her2_annotations):
         paths.segment_dir = os.path.join(paths.save_path, f'slide_segmentations{args.suffix}', slide_name)
-    elif args.extract_tumor_indices_from_cancer_map or args.seg_from_my_cancer_predictions:
+    elif args.extract_tumor_indices_from_cancer_map or args.seg_from_cancer_predictions:
         paths.segment_dir = os.path.join(paths.save_path.replace('IHC', 'HE'), f'cancer_map{args.src_suffix}', matching_he_slide)
     else:
         paths.segment_dir = os.path.join(paths.save_path.replace('IHC', 'HE'), f'slide_segmentations{args.suffix}', matching_he_slide)
@@ -312,7 +315,7 @@ def get_valid_tiles(args, paths, he_tiles, ihc_tiles):
     elif args.seg_y_labels or args.seg_y_predictions:
         matching_tiles = np.load(os.path.join(paths.full_mt_dir, 'ihc_tiles.npy'))
         non_nan_matching_indices = np.array([idx for idx, _ in enumerate(he_tiles) if not np.isnan(matching_tiles[idx])])
-    elif args.cancer_annotations or args.extract_tumor_indices_from_cancer_map or args.seg_from_my_cancer_predictions:
+    elif args.cancer_annotations or args.extract_tumor_indices_from_cancer_map or args.seg_from_cancer_predictions:
         valid_tiles = he_tiles
         valid_indices = list(range(len(he_tiles)))
     else: 
@@ -398,7 +401,7 @@ def get_tile_segment(args, slide_ctx):
     
 
 def load_tumor_indices(args, slide_ctx):
-    if args.save_tumor_indices_from_seg_map or (args.seg_from_my_cancer_predictions and not args.save_ensemble_tumor_indices):
+    if args.save_tumor_indices_from_seg_map or (args.seg_from_cancer_predictions and not args.save_ensemble_tumor_indices):
         slide_ctx.tumor_indices = save_tumor_indices_and_cancer_probs(args, slide_ctx)
 
     elif args.seg_y_predictions:
@@ -1090,7 +1093,7 @@ def save_tumor_indices_and_cancer_probs(args: argparse.Namespace, slide_ctx: Sli
     """
     tumor_indices = []
     non_tumor_indices = []
-    if args.seg_from_my_cancer_predictions:
+    if args.seg_from_cancer_predictions:
         if os.path.exists(slide_ctx.paths.cp):
             cancer_prob = np.load(slide_ctx.paths.cp)
             cancer_prob = cancer_prob[slide_ctx.valid_indices]  # Filter to valid tiles
@@ -1108,18 +1111,18 @@ def save_tumor_indices_and_cancer_probs(args: argparse.Namespace, slide_ctx: Sli
             if slide_ctx.tile_segment[he_thumb_window_center[0][0], he_thumb_window_center[0][1]] == SEGMENT_NON_TUMOR:
                 non_tumor_indices.append(idx)
 
-        if args.seg_from_my_cancer_predictions:
+        if args.seg_from_cancer_predictions:
             tile_pred_segment[he_thumb_window_center[0][0], he_thumb_window_center[0][1]] = cancer_prob[idx]
             if cancer_prob[idx] >= 0.5:
                 tumor_indices.append(idx)
 
     # Save segmentation visualization if using model predictions                
-    if args.seg_from_my_cancer_predictions:
+    if args.seg_from_cancer_predictions:
         save_segmented_tiles(segment_map=tile_pred_segment, segment_dir=slide_ctx.paths.segment_dir, save_name=f'Binary Local Cancer Probability (MPP={args.source_mpp} GigaPath features trained model) val_fold = {args.val_fold}',
                              value_label='Cancer Probability')
 
     # Save tumor/non-tumor indices if requested (either from seg map or from cancer predictions)
-    if args.save_tumor_indices_from_seg_map or args.seg_from_my_cancer_predictions:
+    if args.save_tumor_indices_from_seg_map or args.seg_from_cancer_predictions:
         if len(tumor_indices) == 0:
             print(f"No tumor tiles found for slide {slide_ctx.slide_name}.")
 
@@ -1349,8 +1352,8 @@ def main():
     slides_df = metadata["slides_df"]
 
     for _, row in tqdm(slides_df.iterrows(), total=len(slides_df)):
-        # if '19-14590' not in row['SlideName']:
-        #     continue
+        if '19-14590' not in row['SlideName']:
+            continue
         try:
             slide_ctx = prepare_slide_context(args=args, row=row, paths=paths, metadata=metadata)
             process_slide(args=args, slide_ctx=slide_ctx, collectors=collectors)

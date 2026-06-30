@@ -25,9 +25,9 @@ from torchvision.utils import save_image
 
 # Set the hf token
 # with open("/home/amitf/workspace/Gigapath_GIP/finetune/hf_token.txt", "r") as file:
-with open("/home/amitf/workspace/Gigapath_GIP/finetune/hf_read_token_virchow2.txt", "r") as file:
-    os.environ["HUGGINGFACE_HUB_TOKEN"] = file.read()
-    os.environ["HF_TOKEN"] = file.read()
+# with open("/home/amitf/workspace/Gigapath_GIP/finetune/hf_read_token_virchow2.txt", "r") as file:
+#     os.environ["HUGGINGFACE_HUB_TOKEN"] = file.read()
+#     os.environ["HF_TOKEN"] = file.read()
 
 Image.MAX_IMAGE_PIXELS = None
 ImageFile.LOAD_TRUNCATED_IMAGES = True
@@ -219,9 +219,10 @@ def main():
     parser.add_argument('-g', '--generate_synth_ihc', action='store_true', default=False, help='Use cycle GAN to generate synthetic IHC images from HE images')
     parser.add_argument('-sf', '--synth_fold', type=int, help='Fold to generate synthetic IHC images from HE images', choices=[1, 2, 3, 4, 5, 6], default=-1)
     parser.add_argument('-gckpt', '--gan_ckpt', type=str, help='Checkpoint for the GAN model')
-    parser.add_argument('-mpp', '--mpp', type=float, default=1, help='Target MPP to extract patches with')
+    parser.add_argument('-mpp', '--mpp', type=float, default=0.5, help='Target MPP to extract patches with')
     parser.add_argument('-ot', '--only_tile_encode', action='store_true', default=False, help='Only run tile encoding without slide encoding')
     parser.add_argument('-ete', '--external_tile_encoder', type=str, choices=['virchow2', 'conch', 'uni2'], default='virchow2', help='Use external tile encoder instead of Gigapath')
+    parser.add_argument('-hf', '--hf_token', type=str, default=os.environ.get("HF_TOKEN"), help='Hugging Face token for model access')
 
     args = parser.parse_args()
     print(f'args = {args}')
@@ -229,14 +230,12 @@ def main():
     # set the device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     args.device = device
+
+    # Set the environment variable for the Hugging Face token
+    os.environ["HF_TOKEN"] = args.hf_token
     
     # Paths
-    # base_path = "/SSDStorage/Breast/Carmel/Her2/Batch_2/HER2_2/"
-    # excel_path = os.path.join(base_path, "slides_data_HER2_2.xlsx")
-    # base_path = "/data/Breast/Carmel/9-11/Batch_11/CARMEL11/"
     base_path = args.base_path
-    # excel_path = os.path.join(base_path, "slides_data_CARMEL9.xlsx")
-    # excel_path = "/home/amitf/workspace/WSI/metadata_csvs/Her2_slides_matched_HE_folds_HE.csv"
     excel_path = args.excel_path
     save_path = args.save_path
     target_mpp = args.mpp if args.mpp % 1 != 0 else int(args.mpp) # 2 # 1 

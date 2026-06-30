@@ -11,6 +11,7 @@ def get_finetune_params():
     # task settings
     parser.add_argument('--task_cfg_path',  type=str, default='finetune/task_configs/mutation_5_gene.yaml', help='Path to the task configuration file')
     parser.add_argument('--exp_name',       type=str, default='', help='Experiment name')
+    parser.add_argument('--hf_token',       type=str, default='', help='Hugging face token, needed to load the prov-gigapath model')
     parser.add_argument('--pat_strat',      action='store_true', default=False, help='Patient stratification')
     parser.add_argument('--run_inference',  action='store_true', default=False, help='Only run inference')
     parser.add_argument('--sliding_window_inference',action='store_true', default=False, help='run inference with a sliding window')
@@ -19,7 +20,7 @@ def get_finetune_params():
     parser.add_argument('--create_cancer_map', action='store_true', default=False, help='Create HE tile cancer score map using sliding window inference (with slide cancer model)')
     parser.add_argument('--create_HER2_status_map', action='store_true', default=False, help='Create HE tile HER2 status score map using sliding window inference (with THUFA slide HER2 status model)')
     parser.add_argument('--create_pred_y',  action='store_true', default=False, help='Create HE tile score (from Baseline0)')
-    parser.add_argument('--predict_cancer', action='store_true', default=False, help='Predict tumor/non tumor per tile')
+    parser.add_argument('--predict_cancer', action='store_true', default=False, help='Predict malignant vs benign per tile')
 
     # input data settings
     parser.add_argument('--dataset_csv',    type=str, default='/home/shacharcohen/workspace/WSI/metadata_csvs/largest_with_taylor.csv', help='Dataset csv file')
@@ -46,7 +47,7 @@ def get_finetune_params():
     parser.add_argument('--y_and_tumor_from_map', action='store_true', default=False, help='Get tile scores (y) and tumor mask from the generated maps instead of loading from files')
     parser.add_argument('--load_tile_logits', action='store_true', default=False, help='Load tile logits instead of predicting them')
     parser.add_argument('--target_mpp',     type=float, help='Target tiles MPP', default=0.5, choices=[0.5, 1, 2])
-    parser.add_argument('--all_he_tiles',   action='store_true', default=False, help='Predict tile y for all HE tiles')
+    parser.add_argument('--all_he_tiles',   action='store_true', default=False, help='Use all HE tiles for prediction')
 
     # model settings
     parser.add_argument('--model_arch',     type=str, default='longnet_enc12l768d')
